@@ -6,7 +6,7 @@
  *   - the canvas is a Skia picture recorded each frame (see canvas2d.ts)
  *   - DOM updates (menus, banner, HUD buttons) became a UI state that the
  *     React Native screens subscribe to
- *   - the on-screen touch controls (stick, DRIVE/DINK/LOB, POWER) are drawn on
+ *   - the on-screen touch controls (stick, DRIVE/DINK/LOB/SMASH, HYPER) are drawn on
  *     the court exactly like the browser's touch layout and hit-tested here
  *   - Web Speech -> native TextToSpeech, Web Audio -> react-native-audio-api,
  *     navigator.vibrate -> Vibration, localStorage -> AsyncStorage
@@ -39,9 +39,16 @@ const G = 32;                        // gravity, ft/s^2
 const BOUNCE_Z = 0.55;               // vertical restitution
 const BOUNCE_XY = 0.82;              // horizontal speed kept on bounce
 
-const PLAYER_SPEED = 15;
-const REACH = 3.4;
-const SWING_WINDOW = 0.25;
+// Hyper skill look: electric cyan + the game's lime
+const HYPER_COLOR = '#7cf2ff';
+const HYPER_SPARKS = ['#7cf2ff', '#19b7d6', '#d7f23b', '#ffffff'];
+
+const PLAYER_SPEED = 19.5;           // ft/s at full stick (was 15: felt sluggish on phones)
+const REACH = 3.9;           // furthest the player can reach the ball (ft); a step + lunge covers it
+const CONTACT_IDEAL = 1.3;   // body-to-ball distance where the paddle meets the ball
+const SWING_WINDOW = 0.25;   // a tap with no ball coming: a quick practice swing
+const SHOT_BUFFER = 1.1;     // a tap while the ball is coming: the shot waits this long for the ball
+const RECEIVE_ASSIST = 7;    // ft/s of gentle sideways help toward the contact spot while a shot waits
 const WIN_SCORE = 11;
 const X_MIN = -3, X_MAX = COURT_W + 3; // keeps everyone clear of the referee stands
 
@@ -49,7 +56,7 @@ export type Team = 'player' | 'ai';
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type Mode = 'singles' | 'doubles';
 type State = 'menu' | 'serve' | 'rally' | 'point' | 'paused' | 'over';
-type ShotType = 'drive' | 'dink' | 'lob';
+type ShotType = 'drive' | 'dink' | 'lob' | 'smash';
 
 interface Skill { speed: number; error: number; reaction: number; smart: number; reach: number; home: number }
 // home = how far from the net (feet) a player likes to stand during a rally
@@ -115,6 +122,8 @@ interface Athlete {
   prep: number; prepKind: string; split: number; cheer: number;
   lefty: boolean;
   swing: number; swingType: ShotType;
+  queued?: boolean;                                    // a shot is waiting for the incoming ball
+  lungeT?: number; lungeVX?: number; lungeVY?: number; // quick step toward the ball at contact
   plan: Plan | null; reactT: number; skill: Skill;
   court: 'R' | 'L';
   mvx?: number; mvy?: number;
@@ -141,6 +150,12 @@ interface ArmDir { dx?: number; dy?: number; len: number; up?: boolean; flag?: s
 // =====================================================================
 //  UI state shared with the React Native screens
 // =====================================================================
+/** Summary of a finished match (saved to the cloud match history). */
+export interface MatchResult {
+  mode: Mode; difficulty: Difficulty; playerScore: number; aiScore: number; won: boolean;
+  ralliesWon: number; longestRally: number; opponent: string;
+}
+
 export interface BannerState { id: number; title: string; msg: string; kind: 'good' | 'bad' | ''; show: boolean }
 export interface UiState {
   loading: boolean;
@@ -166,10 +181,11 @@ export interface UiState {
 export const LOAD_TIPS = [
   "Tip: Let the serve and the return bounce — that's the two-bounce rule.",
   'Tip: Stay out of the kitchen when you volley.',
-  'Tip: A soft dink (K) into the kitchen forces the other side to hit up.',
+  'Tip: A soft DINK into the kitchen forces the other side to hit up.',
   'Tip: Only the serving side can score a point.',
-  'Tip: Hold ←/→ (or push the stick) as you hit to aim for a sideline.',
-  'Tip: High balls can be smashed — watch the shadow to judge the height.',
+  'Tip: Push the stick left or right as you hit to aim for a sideline.',
+  'Tip: Tap SMASH on high balls — watch the shadow to judge the height.',
+  'Tip: When the HYPER bar is full, tap HYPER for 5 seconds of stronger shots.',
   'Tip: Serve from the right when your score is even, the left when odd.',
   'Tip: In doubles the score has three numbers — the last one is the server.',
 ];
@@ -476,14 +492,15 @@ export function createGame() {
     bx: 0, by: 0, // base offset from its resting spot (px)
     kx: 0, ky: 0, // knob offset from the base centre (px)
   };
-  interface Btn { kind: ShotType | 'power'; x: number; y: number; r: number; pressed: number }
-  const buttons: Record<'lob' | 'dink' | 'drive' | 'power', Btn> = {
+  interface Btn { kind: ShotType | 'hyper'; x: number; y: number; r: number; pressed: number }
+  const buttons: Record<ShotType | 'hyper', Btn> = {
     lob: { kind: 'lob', x: 0, y: 0, r: 0, pressed: -1 },
     dink: { kind: 'dink', x: 0, y: 0, r: 0, pressed: -1 },
     drive: { kind: 'drive', x: 0, y: 0, r: 0, pressed: -1 },
-    power: { kind: 'power', x: 0, y: 0, r: 0, pressed: -1 },
+    smash: { kind: 'smash', x: 0, y: 0, r: 0, pressed: -1 },
+    hyper: { kind: 'hyper', x: 0, y: 0, r: 0, pressed: -1 },
   };
-  const layout = { joySize: 120, zoneW: 0, zoneTop: 0 };
+  const layout = { joySize: 120, zoneW: 0, zoneTop: 0, gap: 16 };
 
   // Sizes and spots from the browser's landscape touch CSS
   function layoutControls() {
@@ -500,22 +517,29 @@ export function createGame() {
     joy.R = joySize / 2;
     joy.homeX = Math.max(22, 5 * vw) + joy.R;
     joy.homeY = VIEW_H - Math.max(44, zoneH * 0.31) - joy.R;
-    // shot pad: right 12px, bottom 10px, 2x2 grid (LOB over DINK, DRIVE spans both rows)
-    const padH = btn * 2 + 8;
+    // shot pad: right 12px, bottom 10px, 2x2 grid with clear gaps between every button
+    //   HYPER
+    //   LOB    SMASH
+    //   DINK   DRIVE (big, the main shot)
+    const gap = clamp(4.5 * vmin, 16, 26); // space between buttons (scales with the screen)
+    layout.gap = gap;
     const padRight = VIEW_W - 12;
     const padBottom = VIEW_H - 10;
-    const col2W = btnBig;
+    const col2X = padRight - btnBig / 2;
     buttons.drive.r = btnBig / 2;
-    buttons.drive.x = padRight - col2W / 2;
-    buttons.drive.y = padBottom - padH / 2;
-    const col1X = padRight - col2W - 10 - btn / 2;
-    buttons.lob.r = btn / 2; buttons.lob.x = col1X; buttons.lob.y = padBottom - padH + btn / 2;
+    buttons.drive.x = col2X;
+    buttons.drive.y = padBottom - btnBig / 2;
+    buttons.smash.r = btn / 2;
+    buttons.smash.x = col2X;
+    buttons.smash.y = buttons.drive.y - btnBig / 2 - gap - btn / 2;
+    const col1X = padRight - btnBig - gap - btn / 2;
     buttons.dink.r = btn / 2; buttons.dink.x = col1X; buttons.dink.y = padBottom - btn / 2;
-    // POWER sits just above the shot buttons
+    buttons.lob.r = btn / 2; buttons.lob.x = col1X; buttons.lob.y = buttons.dink.y - btn - gap;
+    // HYPER sits above SMASH
     const pw = clamp(15 * vmin, 58, 80);
-    buttons.power.r = pw / 2;
-    buttons.power.x = VIEW_W - 14 - pw / 2;
-    buttons.power.y = VIEW_H - (10 + btn * 2 + 26) - pw / 2;
+    buttons.hyper.r = pw / 2;
+    buttons.hyper.x = col2X;
+    buttons.hyper.y = buttons.smash.y - btn / 2 - gap - pw / 2;
   }
 
   const overlayUp = () => state === 'menu' || state === 'paused' || state === 'over' || ui.customizeOpen;
@@ -535,7 +559,7 @@ export function createGame() {
     }
     joy.bx = joy.cx - joy.homeX; joy.by = joy.cy - joy.homeY;
     const dd = Math.hypot(dx, dy);
-    const full = R * 0.85;                    // full deflection a little inside the ring
+    const full = R * 0.7;                     // full speed well inside the ring: short thumb travel
     const ux = dd ? dx / dd : 0, uy = dd ? dy / dd : 0;
     const amt = Math.min(1, dd / full);
     joy.x = ux * amt; joy.y = uy * amt;
@@ -549,22 +573,26 @@ export function createGame() {
   function touchStart(id: number, x: number, y: number) {
     if (ui.loading || overlayUp()) return;
     ensureAudio();
-    // POWER
-    const pb = buttons.power;
-    if (powerVisible() && Math.hypot(x - pb.x, y - pb.y) <= pb.r + 4) {
-      pb.pressed = id;
-      activateSmash();
+    // Buttons: the one whose edge is nearest the finger wins. Each accepts a little
+    // outside its edge, but never more than half the gap, so neighbours can't overlap.
+    const slop = Math.min(10, layout.gap / 2 - 1);
+    let best: (ShotType | 'hyper') | null = null, bestEdge = Infinity;
+    for (const k of ['lob', 'dink', 'drive', 'smash', 'hyper'] as const) {
+      if (k === 'hyper' && !powerVisible()) continue;
+      const b = buttons[k];
+      const edge = Math.hypot(x - b.x, y - b.y) - b.r; // < 0 inside the button
+      if (edge <= slop && edge < bestEdge) { best = k; bestEdge = edge; }
+    }
+    if (best === 'hyper') {
+      buttons.hyper.pressed = id;
+      activateHyper();
       return;
     }
-    // shot buttons
-    for (const k of ['lob', 'dink', 'drive'] as const) {
-      const b = buttons[k];
-      if (Math.hypot(x - b.x, y - b.y) <= b.r + 4) {
-        b.pressed = id;
-        buzz(8);
-        action(k);
-        return;
-      }
+    if (best) {
+      buttons[best].pressed = id;
+      buzz(8);
+      action(best);
+      return;
     }
     // joystick zone (lower-left)
     if (!joy.active && x <= layout.zoneW && y >= layout.zoneTop) {
@@ -596,9 +624,9 @@ export function createGame() {
   function moveInput() {
     if (joy.active) {
       const m = Math.hypot(joy.x, joy.y);
-      if (m < 0.1) return { dx: 0, dy: 0 };                 // small dead zone
-      const k = Math.min(1, (m - 0.1) / 0.8);                 // full speed from ~90% push
-      const sp = 0.65 * k + 0.35 * k * k * (3 - 2 * k);       // gentle start for fine positioning
+      if (m < 0.06) return { dx: 0, dy: 0 };                // tiny dead zone
+      const k = Math.min(1, (m - 0.06) / 0.74);               // full speed from ~80% push
+      const sp = 0.25 + 0.75 * (1 - (1 - k) * (1 - k));       // moves at once, ramps up fast
       return { dx: (joy.x / m) * sp, dy: (joy.y / m) * sp };
     }
     return { dx: 0, dy: 0 };
@@ -613,10 +641,30 @@ export function createGame() {
     if (state === 'serve' && serverAth === player) {
       playerServe();
     } else if (state === 'rally') {
-      player.swing = SWING_WINDOW;
       player.swingType = type;
-      if (!player.stroke || player.strokeT > 0.7) startStroke(player, strokeKindFor(player, type), 0);
+      const incoming = lastHitter !== 'player' && !ball.netted && !ball.held;
+      if (incoming) {
+        // Queue the shot: the player gets set and swings when the ball reaches the paddle
+        // (no need to time the tap to a fraction of a second, and never too early to be legal).
+        player.swing = SHOT_BUFFER;
+        player.queued = true;
+      } else {
+        player.swing = SWING_WINDOW; // nothing to hit: a quick practice swing
+        player.queued = false;
+        if (!player.stroke || player.strokeT > 0.7) startStroke(player, strokeKindFor(player, type), 0);
+      }
     }
+  }
+
+  // Where (sideways) the player should stand so the incoming ball meets the paddle,
+  // or null if it can't be worked out yet.
+  function contactSpotX(): number | null {
+    if (ball.held || ball.netted || Math.abs(ball.vy) < 1) return null;
+    const lineY = player.y - 0.8;                    // just in front of the body
+    const t = (lineY - ball.y) / ball.vy;
+    if (t < 0 || t > 1.3) return null;
+    const bx = ball.x + ball.vx * t;
+    return bx - domSign(player) * CONTACT_IDEAL * 0.8; // ball on the paddle side
   }
 
   // =====================================================================
@@ -625,7 +673,7 @@ export function createGame() {
 
   // Give the ball a velocity so it lands at (tx, ty) after ~T seconds,
   // lengthening the flight (higher arc) until it clears the net.
-  // g = downward pull on this shot: heavy topspin (the Smash Skill) dips harder than gravity alone.
+  // g = downward pull on this shot: heavy topspin (Hyper drives and smashes) dips harder than gravity alone.
   function launch(tx: number, ty: number, T: number, minClear = 0.35, g = G) {
     const x0 = ball.x, y0 = ball.y, z0 = Math.max(ball.z, 0.3);
     let vx = 0, vy = 0, vz = 0;
@@ -654,34 +702,42 @@ export function createGame() {
   }
 
   // Shared shot maker. tx = intended x, err = accuracy spread (feet).
-  function doHit(hitter: Athlete, type: ShotType, tx: number, err: number, netty = false, power = false) {
-    const strokeKind = power ? 'smash' : strokeKindFor(hitter, type); // decided from the ball as it arrives
+  //   drive: hard and low (the main shot)   dink: soft, into the kitchen
+  //   lob:   high and deep                  smash: hardest hit; best on high balls, risky on low ones
+  // While the player is in Hyper mode every shot is faster, more accurate and lands
+  // in tougher spots, and opponents struggle to return it.
+  function doHit(hitter: Athlete, type: ShotType, tx: number, err: number, netty = false) {
+    const hyper = hitter === player && energy.hyperT > 0;
+    const strokeKind = strokeKindFor(hitter, type); // decided from the ball as it arrives
     const toTop = hitter.team === 'player';
     const deep = (d: number) => (toTop ? d : COURT_L - d);          // d feet from target baseline
     const nearNet = (d: number) => (toTop ? NET_Y - d : NET_Y + d); // d feet from net
-    const smash = !power && type === 'drive' && ball.z > 4.8;
+    const smash = type === 'smash' || (type === 'drive' && ball.z > 4.8);
+    const lowSmash = type === 'smash' && ball.z < 3; // hitting down on a low ball is hard to control
     let ty: number, T: number;
 
-    if (power) { ty = deep(rand(2.5, 5.5)); err *= 0.35; }   // Smash Skill: deep and accurate
-    else if (type === 'dink') ty = nearNet(rand(2.5, 5));
-    else if (type === 'lob') ty = deep(rand(2, 4.5));
-    else ty = smash ? deep(rand(5, 10)) : deep(rand(3, 6));
+    if (type === 'dink') ty = nearNet(hyper ? rand(1.8, 3.2) : rand(2.5, 5));
+    else if (type === 'lob') ty = deep(hyper ? rand(1.2, 3) : rand(2, 4.5));
+    else if (smash) ty = deep(hyper ? rand(2.5, 6) : rand(5, 10));
+    else ty = deep(hyper ? rand(2, 4.5) : rand(3, 6));
 
     // Paddle feel: power adds pace, control tightens accuracy
     const pd = paddleById(hitter.paddle);
     const powerF = 1 + (pd.power - 6) * 0.03;
     const controlF = 1 - (pd.control - 6) * 0.05;
     err *= controlF;
+    if (lowSmash) err *= 1.7;
+    if (hyper) err *= 0.45;
 
     tx += randn() * err * 0.6;
     ty += randn() * err * (type === 'dink' ? 0.4 : 0.7);
     const dist = Math.hypot(tx - ball.x, ty - ball.y);
 
-    if (power) T = dist / (70 * powerF);                      // fastest shot in the game
-    else if (type === 'dink') T = 0.7 + dist / 30;
-    else if (type === 'lob') T = 1.6 + dist / 70;
-    else if (smash) T = dist / (58 * powerF);
-    else T = dist / (rand(38, 44) * powerF);
+    const boost = hyper ? 1.25 : 1; // Hyper: everything is faster
+    if (type === 'dink') T = hyper ? 0.6 + dist / 34 : 0.7 + dist / 30;
+    else if (type === 'lob') T = hyper ? 1.45 + dist / 76 : 1.6 + dist / 70;
+    else if (smash) T = dist / ((lowSmash ? 52 : 58) * powerF * boost);
+    else T = dist / (rand(38, 44) * powerF * boost);
 
     const hitX = ball.x, hitY = ball.y, hitZ = ball.z;
     if (netty) {
@@ -697,9 +753,11 @@ export function createGame() {
       ball.vz = (zAtNet - ball.z + 0.5 * G * t * t) / t;
       ball.held = false;
     } else {
-      launch(tx, ty, T, power ? 0.15 : 0.35, power ? G * 2.4 : G);
+      // Hyper drives and smashes carry heavy topspin: they dip hard after the net
+      const heavy = hyper && (type === 'drive' || type === 'smash');
+      launch(tx, ty, T, heavy ? 0.2 : 0.35, heavy ? G * 1.8 : G);
     }
-    ball.power = power; // power smashes are harder to return
+    ball.power = hyper; // Hyper shots are harder to read and return
 
     lastHitter = hitter.team;
     shots++;
@@ -714,33 +772,31 @@ export function createGame() {
 
     // ---- juice ----
     const mine = hitter === player;
-    if (mine && !power) addEnergy(ENERGY_PER_HIT);
-    if (power) {
-      sfx.power();
-      addShake(15);
-      hitStop = 0.14;
-      flash = 0.6;
-      sparks(hitX, hitY, hitZ, 55, ['#ff4d1a', '#ff9a3c', '#ffd166', '#ffffff'], 1.9);
-      sparks(hitX, hitY, hitZ, 20, ['#ffffff', '#fff3b0'], 2.6);
-      floatText(hitter.x, hitter.y, 'POWER SMASH!', '#ff7b3a', 1.5);
-      buzz([40, 30, 70]);
-    } else if (smash) {
+    if (mine && !hyper) addEnergy(ENERGY_PER_HIT);
+    if (smash) {
       sfx.smash();
-      addShake(8);
-      hitStop = 0.07;
-      flash = 0.3;
+      addShake(hyper ? 13 : 8);
+      hitStop = hyper ? 0.12 : 0.07;
+      flash = hyper ? 0.5 : 0.3;
       sparks(hitX, hitY, hitZ, 28, ['#ffb347', '#ffd166', '#ffffff', '#ff7b3a'], 1.4);
-      floatText(hitter.x, hitter.y, 'SMASH!', '#ffb347', 1.2);
-      if (mine) buzz(40);
+      floatText(hitter.x, hitter.y, hyper ? 'HYPER SMASH!' : 'SMASH!', hyper ? HYPER_COLOR : '#ffb347', hyper ? 1.5 : 1.2);
+      if (mine) buzz(hyper ? [40, 30, 70] : 40);
     } else if (type === 'dink') {
       sfx.soft();
       sparks(hitX, hitY, hitZ, 5, ['#ffffff', '#9ef0b6'], 0.4);
+      if (hyper) floatText(hitter.x, hitter.y, 'HYPER DINK!', HYPER_COLOR, 1.1);
       if (mine) buzz(10);
     } else {
       sfx.hit();
       sparks(hitX, hitY, hitZ, 10, ['#ffffff', '#e8f53b'], 0.7);
-      if (type === 'lob') floatText(hitter.x, hitter.y, 'LOB', '#c8a6ff', 0.8);
+      if (hyper) floatText(hitter.x, hitter.y, type === 'lob' ? 'HYPER LOB!' : 'HYPER DRIVE!', HYPER_COLOR, 1.2);
+      else if (type === 'lob') floatText(hitter.x, hitter.y, 'LOB', '#c8a6ff', 0.8);
       if (mine) buzz(15);
+    }
+    if (hyper) { // electric burst on every Hyper shot
+      sfx.power();
+      addShake(6);
+      sparks(hitX, hitY, hitZ, 30, HYPER_SPARKS, 1.8);
     }
     if (shots === 10) floatText(10, NET_Y, 'EPIC RALLY!', '#d7f23b', 1.3);
 
@@ -752,9 +808,21 @@ export function createGame() {
     let tx: number;
     if (aim !== 0) tx = type === 'dink' ? 10 + aim * 6 : (aim > 0 ? COURT_W - 2 : 2);
     else tx = clamp(player.x, 3, COURT_W - 3);
-    const reachUsed = Math.hypot(player.x - ball.x, player.y - ball.y) / REACH;
+    const dx = ball.x - player.x, dy = ball.y - player.y;
+    const d = Math.hypot(dx, dy);
+    const reachUsed = clamp((d - 0.8) / (REACH - 0.8), 0, 1);
     const err = 0.6 + 0.9 * reachUsed; // sloppier at full stretch
+    // Step and reach toward the ball so the paddle meets it (like a real player lunging)
+    const excess = d - CONTACT_IDEAL;
+    if (excess > 0.05 && d > 0) {
+      const LUNGE_T = 0.12;
+      player.lungeT = LUNGE_T;
+      player.lungeVX = ((dx / d) * excess * 0.85) / LUNGE_T;
+      player.lungeVY = ((dy / d) * excess * 0.85) / LUNGE_T;
+    }
     doHit(player, type, tx, err);
+    // swing timed so the paddle is at the ball now (contact is ~45% through the stroke)
+    startStroke(player, strokeKindFor(player, type), 0.4);
   }
 
   function playerServe() {
@@ -895,19 +963,7 @@ export function createGame() {
     }
   }
 
-  function fault(ath: Athlete, reason: string) {
-    // Kill the ball so it doesn't look like it was played
-    ball.vx *= 0.2; ball.vy *= 0.2;
-    landing = null;
-    floatText(ath.x, ath.y, 'FAULT', '#ff7b7b');
-    if (reason.startsWith('Kitchen')) {
-      const kitchen = { x: COURT_W / 2, y: ownY(ath.team, KITCHEN / 2) };
-      refCall(nearRef(ath.x), 'kitchen', 'Kitchen violation!', { target: kitchen, color: CALL_COLORS.warn, whistle: true });
-    } else {
-      refCall(nearRef(ath.x), 'fault', 'Fault! Two-bounce rule', { target: ath, color: CALL_COLORS.warn, speech: 'Fault! Two bounce rule.', whistle: true });
-    }
-    endRally(other(ath.team), reason);
-  }
+  // (The player never faults by tapping early: a waiting shot holds until it is legal.)
 
   function endRally(winner: Team, reason: string) {
     if (state !== 'rally') return;
@@ -983,6 +1039,8 @@ export function createGame() {
     ball.held = true;
     ball.vx = ball.vy = ball.vz = 0;
     player.swing = 0;
+    player.queued = false;
+    player.lungeT = 0;
     player.mvx = player.mvy = 0;
     interceptor.player = interceptor.ai = null;
 
@@ -1111,7 +1169,7 @@ export function createGame() {
   function domSign(p: Athlete) { return (p.team === 'player' ? 1 : -1) * (p.lefty ? -1 : 1); }
   function sideFor(p: Athlete) { return domSign(p) * (ball.x - p.x) >= -0.3 ? 'fh' : 'bh'; }
   function strokeKindFor(p: Athlete, type: ShotType) {
-    if (type === 'drive' && ball.z > 4.8) return 'smash';
+    if (type === 'smash' || (type === 'drive' && ball.z > 4.8)) return 'smash';
     const side = sideFor(p);
     if (type === 'dink') return 'dink_' + side;
     if (type === 'lob') return 'lob_' + side;
@@ -1132,74 +1190,67 @@ export function createGame() {
   }
 
   // =====================================================================
-  //  Smash Skill — an energy bar that charges during play.
-  //  At 100% tap POWER to arm a power smash; it fires on the
-  //  next ball you can legally reach and only then uses up the energy.
+  //  Hyper — the special skill. An energy bar charges during play; at 100%
+  //  tap HYPER to enter Hyper mode for 5 seconds: every Drive, Lob, Dink and
+  //  Smash is faster, more accurate and harder to return.
   // =====================================================================
   const ENERGY_PER_SECOND = 3.5; // while a rally is live
   const ENERGY_PER_HIT = 7;      // each ball you hit
   const ENERGY_PER_POINT = 12;   // each rally your team wins
-  // Once armed, the smash stays ready until it connects (it never fizzles out)
-  const energy = { value: 0, armed: 0, denied: 0, fullPulse: 0, auraT: 0 };
+  const HYPER_SECONDS = 5;
+  const energy = { value: 0, hyperT: 0, denied: 0, fullPulse: 0, auraT: 0 };
 
-  function resetEnergy() { energy.value = 0; energy.armed = 0; energy.denied = 0; energy.fullPulse = 0; }
+  function resetEnergy() { energy.value = 0; energy.hyperT = 0; energy.denied = 0; energy.fullPulse = 0; }
 
   function addEnergy(n: number) {
-    if (energy.value >= 100) return;
+    if (energy.value >= 100 || energy.hyperT > 0) return; // no charging while Hyper burns
     energy.value = Math.min(100, energy.value + n);
     if (energy.value >= 100) { // just became full
       energy.fullPulse = 1;
       sfx.full();
-      floatText(player.x, player.y, 'SMASH READY', '#ffb347', 1);
+      floatText(player.x, player.y, 'HYPER READY', HYPER_COLOR, 1);
       buzz(30);
     }
   }
 
-  function activateSmash() {
+  function activateHyper() {
     ensureAudio();
     // Works during rallies, while waiting to serve and in the short pause after a point
     if (!(state === 'rally' || state === 'serve' || state === 'point')) return;
-    if (energy.armed > 0) return;
+    if (energy.hyperT > 0) return;
     if (energy.value < 100) { // not charged: no effect, just feedback
       energy.denied = 0.45;
       sfx.deny();
       buzz(20);
       return;
     }
-    energy.armed = 1;
+    energy.hyperT = HYPER_SECONDS;
     sfx.charge();
-    floatText(player.x, player.y, 'POWER UP!', '#ff7b3a', 1.1);
-    sparks(player.x, player.y, 3, 18, ['#ff4d1a', '#ff9a3c', '#ffd166'], 0.9);
-    buzz(25);
-  }
-
-  function powerSmash() {
-    energy.value = 0;
-    energy.armed = 0;
-    player.swing = 0;
-    startStroke(player, 'smash', 0.3);
-    // aim for the biggest gap between the opponents
-    const opps = teamOf('ai');
-    let best = 10, gap = -1;
-    for (const cx of [2.5, 5, 7.5, 10, 12.5, 15, 17.5]) {
-      const g = Math.min(...opps.map(o => Math.abs(cx - o.x)));
-      if (g > gap) { gap = g; best = cx; }
-    }
-    const aim = aimDir();
-    const tx = aim !== 0 ? (aim > 0 ? COURT_W - 2.5 : 2.5) : best;
-    doHit(player, 'drive', tx, 0.6, false, true);
+    sfx.power();
+    addShake(6);
+    flash = 0.35;
+    floatText(player.x, player.y, 'HYPER MODE!', HYPER_COLOR, 1.3);
+    sparks(player.x, player.y, 3, 30, HYPER_SPARKS, 1.1);
+    buzz([30, 20, 50]);
   }
 
   function updateEnergy(dt: number) {
-    if (state === 'rally') addEnergy(ENERGY_PER_SECOND * dt);
-    if (energy.armed > 0) {
+    if (energy.hyperT > 0) {
+      energy.hyperT = Math.max(0, energy.hyperT - dt);
+      energy.value = (100 * energy.hyperT) / HYPER_SECONDS; // the bar drains as Hyper runs out
       energy.auraT -= dt;
-      if (energy.auraT <= 0) { // flames rising around the player while armed
-        energy.auraT = 0.05;
-        spawn({ kind: 'spark', x: player.x + rand(-0.8, 0.8), y: player.y + rand(-0.4, 0.4), z: rand(0.2, 1.5),
-          vx: rand(-1, 1), vy: rand(-1, 1), vz: rand(6, 11), g: 4, life: rand(0.3, 0.5), size: rand(2, 3.5),
-          color: pick(['#ff4d1a', '#ff9a3c', '#ffd166']) });
+      if (energy.auraT <= 0) { // electric sparks rising around the player
+        energy.auraT = 0.04;
+        spawn({ kind: 'spark', x: player.x + rand(-0.8, 0.8), y: player.y + rand(-0.4, 0.4), z: rand(0.2, 1.8),
+          vx: rand(-1, 1), vy: rand(-1, 1), vz: rand(6, 12), g: 4, life: rand(0.3, 0.5), size: rand(2, 3.5),
+          color: pick(HYPER_SPARKS) });
       }
+      if (energy.hyperT <= 0) {
+        energy.value = 0;
+        floatText(player.x, player.y, 'HYPER OVER', '#9fb0c3', 0.9);
+      }
+    } else if (state === 'rally') {
+      addEnergy(ENERGY_PER_SECOND * dt);
     }
     energy.denied = Math.max(0, energy.denied - dt);
     energy.fullPulse = Math.max(0, energy.fullPulse - dt * 1.5);
@@ -1207,46 +1258,62 @@ export function createGame() {
 
   function updatePlayer(dt: number) {
     const { dx, dy } = moveInput();
-    // Ease toward the target speed: quick to start, quick to brake, never jerky
+    // Ease toward the target speed: snappy to start and to stop, never jerky
     const tvx = dx * PLAYER_SPEED, tvy = dy * PLAYER_SPEED;
     const moving = dx !== 0 || dy !== 0;
-    const k = 1 - Math.exp(-dt * (moving ? 20 : 24));
+    const k = 1 - Math.exp(-dt * (moving ? 30 : 32));
     player.mvx = (player.mvx || 0) + (tvx - (player.mvx || 0)) * k;
     player.mvy = (player.mvy || 0) + (tvy - (player.mvy || 0)) * k;
     if (player.swing > 0) player.swing -= dt;
 
     if (state === 'serve' && serverAth === player) {
       player.y = behindBaseline('player');
-      player.x = clamp(player.x + player.mvx * 0.5 * dt, serveHalf[0] + 0.5, serveHalf[1] - 0.5);
+      player.x = clamp(player.x + player.mvx * 0.6 * dt, serveHalf[0] + 0.5, serveHalf[1] - 0.5);
       holdBallFor(player);
       return;
     }
 
-    player.x = clamp(player.x + player.mvx * dt, X_MIN, X_MAX);
-    player.y = clamp(player.y + player.mvy * dt, NET_Y + 0.6, COURT_L + 5.5);
-
-    // Try to connect with the ball during the swing window (or with an armed Smash Skill)
-    const armed = energy.armed > 0;
-    if (state !== 'rally' || (player.swing <= 0 && !armed) || lastHitter === 'player' || ball.held || ball.netted) return;
-    if (sideOf(ball.y) !== 'player') return;
-    const d = Math.hypot(ball.x - player.x, ball.y - player.y);
-
-    // Smash Skill: fires automatically on the next ball you can legally reach
-    if (armed && d <= REACH + 0.9 && ball.z <= 8.5 && ball.z > 0.25) {
-      const legal = !(bounces === 0 && shots < 3) && !(bounces === 0 && inKitchen('player', player.y));
-      if (legal) { powerSmash(); return; }
-      if (player.swing <= 0) return; // wait for a legal chance instead of faulting
+    let mx = player.mvx * dt, my = player.mvy * dt;
+    // the quick step toward the ball at contact
+    if ((player.lungeT || 0) > 0) {
+      const t = Math.min(dt, player.lungeT as number);
+      mx += (player.lungeVX || 0) * t;
+      my += (player.lungeVY || 0) * t;
+      player.lungeT = (player.lungeT as number) - dt;
     }
-    if (player.swing <= 0 || d > REACH || ball.z > 7.5) return;
+    // receive assist: while a shot waits for the ball, ease sideways to put it on the paddle side
+    const waiting = player.queued && player.swing > 0 && state === 'rally' && lastHitter !== 'player';
+    if (waiting) {
+      const sx = contactSpotX();
+      if (sx !== null) {
+        const off = sx - player.x;
+        if (Math.abs(off) < 4.5) mx += clamp(off, -RECEIVE_ASSIST * dt, RECEIVE_ASSIST * dt);
+      }
+    }
+    player.x = clamp(player.x + mx, X_MIN, X_MAX);
+    player.y = clamp(player.y + my, NET_Y + 0.6, COURT_L + 5.5);
+
+    // Connect with the ball while a shot is waiting (or during a practice swing)
+    if (state !== 'rally' || player.swing <= 0 || lastHitter === 'player' || ball.held || ball.netted) return;
+    if (sideOf(ball.y) !== 'player') return;
+    // Never fault on an early tap: a waiting shot holds until it's legal to hit
+    if (bounces === 0 && shots < 3) return;                       // two-bounce rule: let it bounce
+    if (bounces === 0 && inKitchen('player', player.y)) return;  // no volleys in the kitchen
+    const d = Math.hypot(ball.x - player.x, ball.y - player.y);
+    if (d > REACH || ball.z > 7.5) return;
+
+    // Best moment: when the ball is as close to the paddle as it will get. Hold on while it
+    // is still coming closer, unless it's about to bounce a second time or time runs out.
+    const look = 0.05;
+    const dNext = Math.hypot(ball.x + ball.vx * look - player.x, ball.y + ball.vy * look - player.y);
+    const closing = dNext < d - 0.03;
+    const secondBounceSoon = bounces >= 1 && ball.z < 0.45 && ball.vz < 0;
+    const lastChance = player.swing < 0.06;
+    if (closing && d > CONTACT_IDEAL && !secondBounceSoon && !lastChance) return;
 
     player.swing = 0;
-    if (bounces === 0 && shots < 3) {
-      fault(player, 'Two-bounce rule!');
-    } else if (bounces === 0 && inKitchen('player', player.y)) {
-      fault(player, 'Kitchen volley!');
-    } else {
-      playerHit(player.swingType);
-    }
+    player.queued = false;
+    playerHit(player.swingType);
   }
 
   // =====================================================================
@@ -1984,15 +2051,22 @@ export function createGame() {
     ctx.beginPath();
     ctx.ellipse(g.x + s * 0.25, g.y + s * 0.05, s * 0.95 * shK, s * 0.3 * shK, 0, 0, Math.PI * 2);
     ctx.fill();
-    if (p.human && energy.armed > 0) {
+    if (p.human && energy.hyperT > 0) { // Hyper mode: electric ring under the player
       const pulse = 0.5 + 0.5 * Math.sin(clock * 14);
-      ctx.strokeStyle = `rgba(255,110,40,${0.55 + 0.35 * pulse})`;
+      ctx.strokeStyle = `rgba(124,242,255,${0.6 + 0.35 * pulse})`;
       ctx.lineWidth = Math.max(2, s * 0.14);
       groundEllipsePath(p.x, p.y, 1.6 + pulse * 0.35, 1.6 + pulse * 0.35);
       ctx.stroke();
-      ctx.fillStyle = `rgba(255,120,40,${0.12 + 0.08 * pulse})`;
+      ctx.fillStyle = `rgba(124,242,255,${0.14 + 0.08 * pulse})`;
       groundEllipsePath(p.x, p.y, 2.2, 2.2);
       ctx.fill();
+    }
+    if (p.human && p.queued && p.swing > 0) { // a shot is ready and waiting for the ball
+      const r = 1.95 + 0.25 * Math.sin(clock * 12);
+      ctx.strokeStyle = 'rgba(215,242,59,0.9)';
+      ctx.lineWidth = Math.max(2, s * 0.12);
+      groundEllipsePath(p.x, p.y, r, r);
+      ctx.stroke();
     }
     if (p.human) {
       ctx.strokeStyle = `rgba(255,255,255,${0.65 + 0.25 * Math.sin(clock * 4)})`;
@@ -2710,11 +2784,12 @@ export function createGame() {
     ctx.restore();
   }
 
-  // Smash Skill energy bar (top-left of the court in the touch layout)
+  // Hyper energy bar (top-left of the court in the touch layout)
   function drawEnergyBar() {
     const st = state === 'paused' ? pausedFrom : state;
     if (!(st === 'serve' || st === 'rally' || st === 'point')) return;
-    const full = energy.value >= 100, armed = energy.armed > 0;
+    const armed = energy.hyperT > 0; // Hyper mode running
+    const full = energy.value >= 100 && !armed;
     const w = clamp(VIEW_W * 0.3, 120, 210), h = 12;
     const shakeX = energy.denied > 0 ? Math.sin(clock * 80) * 5 * (energy.denied / 0.45) : 0;
     const x = 14 + shakeX, y = compactHud ? 52 : VIEW_H - h - 14;
@@ -2724,26 +2799,26 @@ export function createGame() {
     ctx.fillStyle = 'rgba(10,16,26,0.62)';
     rr(x - 8, y - 22, w + 16, h + 30, 10);
     ctx.fill();
-    // labels: "⚡ SMASH"
+    // labels: "⚡ HYPER"
     ctx.font = '900 11px system-ui, sans-serif';
     ctx.textBaseline = 'bottom';
     ctx.lineWidth = 3;
     ctx.strokeStyle = 'rgba(0,0,0,0.6)';
     ctx.textAlign = 'left';
-    ctx.fillStyle = '#ffcc33';
+    ctx.fillStyle = HYPER_COLOR;
     const bw = boltPath(x, y - 5, 11);
     ctx.fill();
-    ctx.strokeText('SMASH', x + bw + 4, y - 4);
-    ctx.fillStyle = full ? '#ffb347' : '#e8edf3';
-    ctx.fillText('SMASH', x + bw + 4, y - 4);
-    const right = armed ? 'ARMED!' : full ? 'TAP POWER' : `${Math.floor(energy.value)}%`;
+    ctx.strokeText('HYPER', x + bw + 4, y - 4);
+    ctx.fillStyle = full || armed ? HYPER_COLOR : '#e8edf3';
+    ctx.fillText('HYPER', x + bw + 4, y - 4);
+    const right = armed ? `ACTIVE ${energy.hyperT.toFixed(1)}s` : full ? 'TAP HYPER' : `${Math.floor(energy.value)}%`;
     ctx.textAlign = 'right';
     ctx.strokeText(right, x + w, y - 4);
-    ctx.fillStyle = armed ? `rgba(255,${Math.round(120 + 100 * pulse)},60,1)` : full ? `rgba(255,${Math.round(180 + 60 * pulse)},90,1)` : (energy.denied > 0 ? '#ff7b7b' : '#c9d3df');
+    ctx.fillStyle = armed || full ? `rgba(${Math.round(124 + 100 * pulse)},242,255,1)` : (energy.denied > 0 ? '#ff7b7b' : '#c9d3df');
     ctx.fillText(right, x + w, y - 4);
     // glow when ready
     if (full || armed) {
-      ctx.strokeStyle = `rgba(255,140,50,${0.35 + 0.5 * pulse})`;
+      ctx.strokeStyle = `rgba(124,242,255,${0.35 + 0.5 * pulse})`;
       ctx.lineWidth = 2 + pulse * 2;
       rr(x - 4, y - 4, w + 8, h + 8, (h + 8) / 2);
       ctx.stroke();
@@ -2758,8 +2833,8 @@ export function createGame() {
     ctx.clip();
     const fw = (w * energy.value) / 100;
     const g = ctx.createLinearGradient(x, 0, x + w, 0);
-    g.addColorStop(0, full ? '#ff4d1a' : '#ff8a3c');
-    g.addColorStop(1, '#ffd166');
+    g.addColorStop(0, full || armed ? '#19b7d6' : '#3aa0ff');
+    g.addColorStop(1, full || armed ? '#d7f23b' : HYPER_COLOR);
     ctx.fillStyle = g;
     ctx.fillRect(x, y, fw, h);
     if (full) { // moving shine stripes
@@ -2898,12 +2973,13 @@ export function createGame() {
     shot(buttons.lob, 'LOB', '#c8a6ff', '#8d5cf0', 0.2);
     shot(buttons.dink, 'DINK', '#9ef0b6', '#3fbf6b', 0.2);
     shot(buttons.drive, 'DRIVE', '#f1ff8a', '#c5dc1b', 0.16);
+    shot(buttons.smash, 'SMASH', '#ffc59a', '#ff5a1f', 0.18);
 
-    // POWER: its ring shows the charge
+    // HYPER: its ring shows the charge (and drains while Hyper mode runs)
     if (powerVisible()) {
-      const b = buttons.power;
+      const b = buttons.hyper;
       const v = Math.floor(energy.value);
-      const full = v >= 100 && energy.armed <= 0, armed = energy.armed > 0;
+      const armed = energy.hyperT > 0, full = v >= 100 && !armed;
       const deny = energy.denied > 0 ? Math.sin(clock * 160) * 4 : 0;
       const cx = b.x + deny, cy = b.y, R2 = b.r;
       ctx.save();
@@ -2911,13 +2987,13 @@ export function createGame() {
         const period = armed ? 0.35 : 0.9;
         const ph = (clock % period) / period;
         const spread = 10 * ph;
-        ctx.fillStyle = `rgba(255,123,58,${0.7 * (1 - ph)})`;
+        ctx.fillStyle = `rgba(124,242,255,${0.7 * (1 - ph)})`;
         ctx.beginPath(); ctx.arc(cx, cy, R2 + spread, 0, Math.PI * 2); ctx.fill();
       }
       ctx.fillStyle = 'rgba(255,255,255,0.14)';
       ctx.beginPath(); ctx.arc(cx, cy, R2, 0, Math.PI * 2); ctx.fill();
       if (v > 0) {
-        ctx.fillStyle = '#ff7b3a';
+        ctx.fillStyle = HYPER_COLOR;
         ctx.beginPath();
         ctx.moveTo(cx, cy);
         ctx.arc(cx, cy, R2, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * Math.min(100, v)) / 100);
@@ -2926,8 +3002,8 @@ export function createGame() {
       }
       const ir = R2 - 5;
       const ig = ctx.createRadialGradient(cx - ir * 0.3, cy - ir * 0.4, 0, cx, cy, ir * 1.15);
-      if (armed) { ig.addColorStop(0, '#ffe08a'); ig.addColorStop(1, '#ff3b1a'); }
-      else if (full) { ig.addColorStop(0, '#ffb347'); ig.addColorStop(1, '#ff5a1f'); }
+      if (armed) { ig.addColorStop(0, '#f3ffb0'); ig.addColorStop(1, '#19b7d6'); }
+      else if (full) { ig.addColorStop(0, '#c8fbff'); ig.addColorStop(1, '#19b7d6'); }
       else { ig.addColorStop(0, '#3b4656'); ig.addColorStop(1, '#161d28'); }
       ctx.fillStyle = ig;
       ctx.beginPath(); ctx.arc(cx, cy, ir, 0, Math.PI * 2); ctx.fill();
@@ -2935,8 +3011,8 @@ export function createGame() {
       ctx.font = `900 ${Math.round(clamp(2.6 * vmin, 10, 13))}px system-ui, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = armed ? '#ffffff' : full ? '#1b1006' : '#9fb0c3';
-      ctx.fillText('POWER', cx, cy);
+      ctx.fillStyle = armed || full ? '#06222a' : '#9fb0c3';
+      ctx.fillText(armed ? `${Math.ceil(energy.hyperT)}s` : 'HYPER', cx, cy);
       ctx.restore();
     }
   }
@@ -3128,7 +3204,14 @@ export function createGame() {
       speech: `Game! ${winLine}, ${hi} to ${lo}.`,
     });
     refs[1].pose = 'point'; refs[1].poseT = 3; refs[1].target = wc;
+
+    const result: MatchResult = {
+      mode, difficulty: diff, playerScore: score.player, aiScore: score.ai, won,
+      ralliesWon: pointsWon, longestRally, opponent: teamLabel('ai'),
+    };
+    matchListeners.forEach(fn => { try { fn(result); } catch { /* a listener never breaks the game */ } });
   }
+  const matchListeners = new Set<(r: MatchResult) => void>();
 
   // "Main menu" from the in-game Menu keeps the match paused behind it, so ‹ Back
   // returns to the in-game Menu and Resume. Starting a new game replaces it.
@@ -3183,7 +3266,7 @@ export function createGame() {
   function toMenu() {
     state = 'menu';
     hush();
-    energy.armed = 0;
+    energy.hyperT = 0;
     for (const r of refs) { r.bubble = null; r.pose = 'idle'; }
     ball.held = true;
     setMode(ui.selectedMode);
@@ -3357,6 +3440,14 @@ export function createGame() {
     openCustomize, closeCustomize,
     setCustomizeSaver(fn: (() => void) | null) { customizeSaver = fn; },
     toggleMute, setDifficulty, setSelectedMode, setVoice,
+    // read-only snapshot for automated tests (no effect on the game)
+    debug: () => ({
+      state, px: player.x, py: player.y, bx: ball.x, by: ball.y, bz: ball.z,
+      energy: energy.value, hyperT: energy.hyperT, shots, bounces, lastHitter, buttons,
+    }),
+    // cloud
+    setProfile: applyProfile,
+    onMatchEnd(fn: (r: MatchResult) => void) { matchListeners.add(fn); return () => { matchListeners.delete(fn); }; },
   };
 }
 

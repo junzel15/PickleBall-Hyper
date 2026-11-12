@@ -3,14 +3,15 @@ import { Animated, Easing, Pressable, StyleSheet, Text, View } from 'react-nativ
 import type { Game, UiState } from '../game/engine';
 import { drawPortrait, paddleById } from '../game/customize';
 import { BackButton, Btn, Card, Details, Drawing, GradientTitle, Label, Li, Overlay, Tap } from './common';
+import type { CloudScreen } from './CloudScreens';
 import { C } from './theme';
 
 const CONTROLS = [
   '**Left stick** moves your player',
-  '**DRIVE** hits hard (and serves), **DINK** drops it soft into the kitchen, **LOB** goes high and deep',
+  '**DRIVE** hits hard and low (and serves), **DINK** drops it soft into the kitchen, **LOB** goes high and deep, **SMASH** hits as hard as possible (best on high balls)',
   'Push the stick left/right while you hit to aim at a sideline',
-  'Tap the button as the ball reaches you',
-  '**POWER** (bottom-right of the court): **Smash Skill** when its ring is full',
+  'Tap a shot as the ball comes toward you: your player swings when it reaches the paddle (and waits for the bounce when the rules need it)',
+  '**HYPER** (above SMASH): your special skill, ready when its ring is full',
 ];
 const RULES = [
   'Serve diagonally into the opposite service box. Landing in the kitchen is a fault.',
@@ -18,7 +19,7 @@ const RULES = [
   "**Kitchen:** you can't volley (hit before the bounce) while standing in the non-volley zone.",
   'Only the server scores. Lose the rally while serving = side out.',
   'Serve from the right when your score is even, the left when odd.',
-  "**Smash Skill ⚡:** your energy bar fills during rallies, faster each time you hit the ball (+7%) and when your team wins a point (+12%). At **100%** tap **POWER** to power up: you glow, and your next shot on a ball you can legally reach (it waits for one) becomes a blazing power smash that is very hard to return. If the bar isn't full, nothing happens. The power smash still follows the two-bounce and kitchen rules, and the energy is only used when you actually hit the ball.",
+  "**Hyper ⚡ (special skill):** the HYPER bar fills during rallies, faster each time you hit the ball (+7%) and when your team wins a point (+12%). At **100%** tap **HYPER**: for **5 seconds** you glow and every Drive, Lob, Dink and Smash is faster, more accurate and much harder to return. If the bar isn't full, nothing happens. Hyper shots still follow the two-bounce and kitchen rules.",
   '**Doubles (2 vs 2):** you team up with a computer partner against two computer opponents (each game they get new names). Both partners serve before a side out, except at the start, which is called “0-0-2”. Partners switch sides only after winning a point on their serve. The score is called as server – receiver – server number.',
   "The referees call close balls **“Inside”**, **“Out”**, faults and kitchen violations, and announce the score (server's score first) before every serve.",
 ];
@@ -92,7 +93,10 @@ function Switch({ on, onToggle, label }: { on: boolean; onToggle: () => void; la
   );
 }
 
-export function MainMenu({ game, ui, short }: { game: Game; ui: UiState; short: boolean }) {
+export function MainMenu({ game, ui, short, signedIn, onOpenCloud, onOpenTutorial }: {
+  game: Game; ui: UiState; short: boolean; signedIn: boolean; onOpenCloud: (c: CloudScreen) => void;
+  onOpenTutorial: () => void;
+}) {
   const pd = paddleById(ui.profile.paddle);
   const top = (
     <>
@@ -136,6 +140,12 @@ export function MainMenu({ game, ui, short }: { game: Game; ui: UiState; short: 
     <>
       {ui.voiceAvailable && <Switch on={ui.voiceOn} onToggle={() => game.setVoice(!ui.voiceOn)} label="Referee voice" />}
       <PlayButton title={ui.suspended ? 'New game' : 'Play'} onPress={() => game.startGame()} animate={!short} />
+      <View style={s.cloudRow}>
+        <Btn title="📜 History" secondary small onPress={() => onOpenCloud('history')} style={s.cloudBtn} />
+        <Btn title="🏆 Leaders" secondary small onPress={() => onOpenCloud('leaderboard')} style={s.cloudBtn} />
+        <Btn title={signedIn ? '👤 Account' : '👤 Sign in'} secondary small onPress={() => onOpenCloud('account')} style={s.cloudBtn} />
+      </View>
+      <Btn title="🎓 How to play" secondary small onPress={onOpenTutorial} style={s.howTo} />
       <Details summary="Controls">{CONTROLS.map(t => <Li key={t} text={t} />)}</Details>
       <Details summary="Rules">{RULES.map(t => <Li key={t} text={t} />)}</Details>
       <Text style={s.version}>Version 20</Text>
@@ -226,6 +236,9 @@ const s = StyleSheet.create({
   switchKnob: { position: 'absolute', top: 3, width: 16, height: 16, borderRadius: 8 },
   playWrap: { justifyContent: 'center' },
   playGlow: { ...StyleSheet.absoluteFill, borderRadius: 12, backgroundColor: C.accent },
+  cloudRow: { flexDirection: 'row', gap: 6, marginTop: 10 },
+  howTo: { marginTop: 6 },
+  cloudBtn: { flex: 1, paddingHorizontal: 4 },
   playBtn: { paddingVertical: 12, paddingHorizontal: 44, alignSelf: 'stretch' },
   version: { marginTop: 10, fontSize: 11, color: C.muted, opacity: 0.7, textAlign: 'center' },
 });

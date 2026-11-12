@@ -5,12 +5,16 @@ import type { BannerState, Game, UiState } from '../game/engine';
 import { Btn, Card, Overlay, Tap } from './common';
 import { C } from './theme';
 
-export function PauseMenu({ game }: { game: Game }) {
+export function PauseMenu({ game, ui }: { game: Game; ui: UiState }) {
   return (
     <Overlay>
       <Card style={{ maxWidth: 300, alignItems: 'center' }}>
         <Text style={s.h2}>Menu</Text>
         <Text style={s.tagline}>Game paused</Text>
+        <View style={s.playerPill}>
+          <Text style={s.playerLabel}>PLAYING AS</Text>
+          <Text style={s.playerName} numberOfLines={1}>{ui.profile.name}</Text>
+        </View>
         <View style={s.menuList}>
           <Btn title="▶ Resume" onPress={() => game.togglePause()} />
           <Btn title="🎨 Customize player" secondary onPress={() => game.openCustomize()} />
@@ -88,6 +92,12 @@ const s = StyleSheet.create({
   h2: { color: C.text, fontSize: 26, fontWeight: '800', marginBottom: 6, textAlign: 'center' },
   tagline: { color: C.muted, fontSize: 14, marginTop: 4, marginBottom: 8, textAlign: 'center' },
   final: { color: C.text, fontSize: 40, fontWeight: '800', fontVariant: ['tabular-nums'], textAlign: 'center' },
+  playerPill: {
+    alignSelf: 'stretch', alignItems: 'center', marginTop: 4, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 12,
+    backgroundColor: 'rgba(215,242,59,0.08)', borderWidth: 1, borderColor: 'rgba(215,242,59,0.35)',
+  },
+  playerLabel: { color: C.muted, fontSize: 10, fontWeight: '800', letterSpacing: 1.4 },
+  playerName: { color: C.accent, fontSize: 18, fontWeight: '900', marginTop: 1 },
   menuList: { gap: 10, marginTop: 14, alignSelf: 'stretch' },
   row: { flexDirection: 'row', gap: 10, justifyContent: 'center', marginTop: 14 },
   bannerWrap: { position: 'absolute', left: 0, right: 0, top: '58%', alignItems: 'center', transform: [{ translateY: -36 }] },

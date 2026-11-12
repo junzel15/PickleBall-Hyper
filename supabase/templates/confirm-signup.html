@@ -1,0 +1,137 @@
+<!--
+  PickleBall: Hyper - sign-up verification code (OTP) email.
+  Used by Supabase Auth for "Confirm signup", including every "Send a new code" (resend).
+  Applied by: node supabase/configure-auth.mjs   (or paste into Dashboard -> Authentication -> Emails -> Confirm signup)
+  Subject:    Your PickleBall: Hyper code: {{ .Token }}
+  Variables:  {{ .Token }} = the one-time code, {{ .Email }} = the player's email.
+  There is deliberately no confirmation link: players type the code in the game.
+  Built with tables and inline styles so it renders in Gmail, Outlook, Apple Mail and phone mail apps.
+-->
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="light dark">
+  <meta name="supported-color-schemes" content="light dark">
+  <title>Your PickleBall: Hyper verification code</title>
+  <style>
+    @media (max-width: 480px) {
+      .px { padding-left: 20px !important; padding-right: 20px !important; }
+      .code { font-size: 32px !important; letter-spacing: 8px !important; }
+    }
+  </style>
+</head>
+<body style="margin:0;padding:0;background-color:#0b111a;-webkit-text-size-adjust:100%;">
+  <!-- inbox preview text -->
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#0b111a;font-size:1px;line-height:1px;">
+    Your PickleBall: Hyper verification code is {{ .Token }}. It expires in 15 minutes.
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#0b111a" style="background-color:#0b111a;">
+    <tr>
+      <td align="center" style="padding:32px 12px;">
+
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+               style="max-width:480px;border-collapse:separate;background-color:#172233;border:1px solid #26344a;border-radius:18px;overflow:hidden;">
+
+          <!-- header: court-blue band with the app icon -->
+          <tr>
+            <td align="center" bgcolor="#1f5c9e"
+                style="background-color:#1f5c9e;background-image:linear-gradient(160deg,#2e78c2 0%,#1f5c9e 55%,#173f6e 100%);padding:30px 24px 26px 24px;">
+              <img src="https://raw.githubusercontent.com/junzel15/PickleBall-Hyper/main/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
+                   width="72" height="72" alt="PickleBall: Hyper"
+                   style="display:block;width:72px;height:72px;border:0;border-radius:18px;outline:none;text-decoration:none;">
+              <div style="margin-top:14px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:24px;line-height:30px;font-weight:800;color:#ffffff;letter-spacing:0.3px;">
+                PickleBall: <span style="color:#d7f23b;">Hyper</span>
+              </div>
+              <div style="margin-top:4px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:18px;color:#cfe2f7;">
+                Singles &amp; doubles pickleball vs the CPU
+              </div>
+            </td>
+          </tr>
+
+          <!-- lime accent stripe (the ball) and orange (the paddle) -->
+          <tr>
+            <td style="padding:0;font-size:0;line-height:0;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td width="70%" height="4" bgcolor="#d7f23b" style="background-color:#d7f23b;font-size:0;line-height:0;">&nbsp;</td>
+                  <td width="30%" height="4" bgcolor="#f28c28" style="background-color:#f28c28;font-size:0;line-height:0;">&nbsp;</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- greeting -->
+          <tr>
+            <td class="px" style="padding:28px 32px 0 32px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+              <div style="font-size:20px;line-height:26px;font-weight:800;color:#eef3f8;">Verify your email</div>
+              <div style="margin-top:8px;font-size:15px;line-height:23px;color:#c3cfdc;">
+                Welcome to the court! Enter this code in the game to finish creating your account.
+              </div>
+            </td>
+          </tr>
+
+          <!-- the code -->
+          <tr>
+            <td align="center" class="px" style="padding:24px 32px 8px 32px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center">
+                <tr>
+                  <td align="center" bgcolor="#0d1520"
+                      style="background-color:#0d1520;border:2px solid #d7f23b;border-radius:14px;padding:16px 26px;">
+                    <div class="code"
+                         style="font-family:'Courier New',Consolas,Menlo,monospace;font-size:38px;line-height:44px;font-weight:700;letter-spacing:10px;padding-left:10px;color:#d7f23b;mso-line-height-rule:exactly;">
+                      {{ .Token }}
+                    </div>
+                  </td>
+                </tr>
+              </table>
+              <div style="margin-top:12px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:19px;color:#9fb0c3;">
+                Expires in <strong style="color:#eef3f8;">15 minutes</strong> &middot; can be used once
+              </div>
+            </td>
+          </tr>
+
+          <!-- how to use -->
+          <tr>
+            <td class="px" style="padding:20px 32px 0 32px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+                     style="background-color:#1d2b3e;border-radius:12px;">
+                <tr>
+                  <td style="padding:14px 16px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:20px;color:#c3cfdc;">
+                    <strong style="color:#eef3f8;">How to use it:</strong> go back to PickleBall: Hyper, type the code on the
+                    <em>Verify email</em> screen and tap <strong style="color:#d7f23b;">Verify &amp; play</strong>.
+                    Need a new one? Tap <em>Send a new code</em> in the game.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- security -->
+          <tr>
+            <td class="px" style="padding:20px 32px 28px 32px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:12px;line-height:19px;color:#8495a8;">
+              This code was requested for <span style="color:#c3cfdc;">{{ .Email }}</span>.
+              Never share it with anyone; the PickleBall: Hyper team will never ask for it.
+              If you didn't sign up, you can safely ignore this email. Without the code the account can't be used.
+            </td>
+          </tr>
+        </table>
+
+        <!-- footer -->
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:480px;">
+          <tr>
+            <td align="center" style="padding:18px 12px 0 12px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:11px;line-height:17px;color:#5f6f83;">
+              &#127955; PickleBall: Hyper &middot; Dinks, drives, lobs and the kitchen<br>
+              This is an automated message. Please don't reply.
+            </td>
+          </tr>
+        </table>
+
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

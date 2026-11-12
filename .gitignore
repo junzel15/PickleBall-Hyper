@@ -79,3 +79,11 @@ yarn-error.log
 *.keystore
 !debug.keystore
 keystore.properties
+
+# Local environment (copy .env.example)
+.env
+.env.*
+!.env.example
+
+# Local secrets for supabase/configure-auth.mjs (never commit)
+supabase/.secrets.local

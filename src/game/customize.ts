@@ -1223,7 +1223,16 @@ export function drawHeadBillboard(ctx: Ctx2D, a: HeadLook, X: number, Y: number,
 // =====================================================================
 //  Profile (saved on the device)
 // =====================================================================
-export interface Profile { name: string; avatar: Avatar; paddle: string }
+/** age is asked once after registration; null until the player gives it. */
+export interface Profile { name: string; avatar: Avatar; paddle: string; age?: number | null }
+
+export const MIN_AGE = 5;
+export const MAX_AGE = 120;
+/** A whole-number age in range, or null. */
+export function cleanAge(a: unknown): number | null {
+  const n = typeof a === 'string' && /^\s*\d{1,3}\s*$/.test(a) ? Number(a) : typeof a === 'number' ? a : NaN;
+  return Number.isInteger(n) && n >= MIN_AGE && n <= MAX_AGE ? n : null;
+}
 const KEY = 'pickleball.profile.v1';
 export const DEFAULT_NAME = 'Player';
 
@@ -1243,16 +1252,19 @@ function sanitizeAvatar(a: unknown): Avatar {
   return out;
 }
 
-export const cloneProfile = (p: Profile): Profile => ({ name: p.name, avatar: { ...p.avatar }, paddle: p.paddle });
-export const defaultProfile = (): Profile => ({ name: DEFAULT_NAME, avatar: { ...DEFAULT_AVATAR }, paddle: DEFAULT_PADDLE });
+export const cloneProfile = (p: Profile): Profile => ({ name: p.name, avatar: { ...p.avatar }, paddle: p.paddle, age: p.age ?? null });
+export const defaultProfile = (): Profile => ({ name: DEFAULT_NAME, avatar: { ...DEFAULT_AVATAR }, paddle: DEFAULT_PADDLE, age: null });
+
+/** Turns stored or downloaded data into a valid profile (unknown values fall back to defaults). */
+export function sanitizeProfile(raw: unknown): Profile {
+  const p = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  return { name: cleanName(p.name), avatar: sanitizeAvatar(p.avatar), paddle: paddleById(String(p.paddle)).id, age: cleanAge(p.age) };
+}
 
 export async function loadProfile(): Promise<Profile> {
   try {
     const raw = await AsyncStorage.getItem(KEY);
-    if (raw) {
-      const p = JSON.parse(raw);
-      return { name: cleanName(p.name), avatar: sanitizeAvatar(p.avatar), paddle: paddleById(p.paddle).id };
-    }
+    if (raw) return sanitizeProfile(JSON.parse(raw));
   } catch {
     /* storage unavailable */
   }
