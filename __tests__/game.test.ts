@@ -43,7 +43,7 @@ describe('profile', () => {
 
   test('unknown paddles fall back to the default', () => {
     expect(paddleById('nope').id).toBe(DEFAULT_PADDLE);
-    expect(PADDLES).toHaveLength(12);
+    expect(PADDLES).toHaveLength(26); // 12 originals + 14 pro line-up designs
   });
 
   test('a saved profile is loaded and sanitized', async () => {

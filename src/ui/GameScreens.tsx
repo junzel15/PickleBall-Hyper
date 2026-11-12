@@ -3,26 +3,23 @@ import React, { useEffect, useRef } from 'react';
 import { Animated, Easing, StyleSheet, Text, View } from 'react-native';
 import type { BannerState, Game, UiState } from '../game/engine';
 import { Btn, Card, Overlay, Tap } from './common';
+import { GameButton, GhostButton, MenuSheet, useUiScale } from './gameUi';
 import { C } from './theme';
 
+/** In-game pause menu: the same panel, buttons and backdrop as the main and online menus. */
 export function PauseMenu({ game, ui }: { game: Game; ui: UiState }) {
+  const scale = useUiScale();
+  const { z } = scale;
   return (
-    <Overlay>
-      <Card style={{ maxWidth: 300, alignItems: 'center' }}>
-        <Text style={s.h2}>Menu</Text>
-        <Text style={s.tagline}>Game paused</Text>
-        <View style={s.playerPill}>
-          <Text style={s.playerLabel}>PLAYING AS</Text>
-          <Text style={s.playerName} numberOfLines={1}>{ui.profile.name}</Text>
-        </View>
-        <View style={s.menuList}>
-          <Btn title="▶ Resume" onPress={() => game.togglePause()} />
-          <Btn title="🎨 Customize player" secondary onPress={() => game.openCustomize()} />
-          <Btn title="↻ Restart match" secondary onPress={() => game.startGame()} />
-          <Btn title="⌂ Main menu" secondary onPress={() => game.openMainMenuFromGame()} />
-        </View>
-      </Card>
-    </Overlay>
+    <MenuSheet kicker={`PLAYING AS ${ui.profile.name.toUpperCase()}`} title="Match paused" icon="pause" ui={scale} maxWidth={420}>
+      {/* Resume: the biggest, clearest button on the screen */}
+      <GameButton title="RESUME" sub="Back to the match" icon="play" onPress={() => game.togglePause()} glow z={z} height={72} titleSize={26} />
+      {/* (Customize lives on the main menu only: no duplicate options here) */}
+      <View style={[s.pauseRow, { gap: z(10) }]}>
+        <GhostButton title="Restart match" icon="refresh" onPress={() => game.startGame()} z={z} style={[s.flex1, { minHeight: z(50) }]} />
+        <GhostButton title="Main menu" icon="door" onPress={() => game.openMainMenuFromGame()} z={z} style={[s.flex1, { minHeight: z(50) }]} />
+      </View>
+    </MenuSheet>
   );
 }
 
@@ -89,6 +86,8 @@ export function HudMini({ game, ui, overlayUp }: { game: Game; ui: UiState; over
 }
 
 const s = StyleSheet.create({
+  pauseRow: { flexDirection: 'row' },
+  flex1: { flex: 1, minWidth: 0 },
   h2: { color: C.text, fontSize: 26, fontWeight: '800', marginBottom: 6, textAlign: 'center' },
   tagline: { color: C.muted, fontSize: 14, marginTop: 4, marginBottom: 8, textAlign: 'center' },
   final: { color: C.text, fontSize: 40, fontWeight: '800', fontVariant: ['tabular-nums'], textAlign: 'center' },

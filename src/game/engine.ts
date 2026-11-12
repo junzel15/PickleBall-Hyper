@@ -22,6 +22,10 @@ import {
   Avatar, BOTS, cloneProfile, defaultProfile, drawHeadBillboard, HeadLook, Look,
   PADDLES, paddleById, paddleSprite, Profile, SHOES,
 } from './customize';
+import {
+  BallW, GuestMsg, HostMsg, KEEPALIVE_MS, INPUT_MS, MatchEvent, mirrorBall, packBall, parseGuestMsg,
+  parseHostMsg, r2, RallyW, SNAPSHOT_MS, Snapshot, TeamW,
+} from './net';
 
 // =====================================================================
 //  Court geometry (all game units are in FEET; a real court is 20 x 44)
@@ -34,7 +38,9 @@ const NET_Y = 22;
 const KITCHEN = 7;
 const TOP_KITCHEN = NET_Y - KITCHEN; // 15 — CPU's kitchen line
 const BOT_KITCHEN = NET_Y + KITCHEN; // 29 — your kitchen line
-const NET_H = 2.9;                   // ~34-36 inches
+const NET_H = 2.9;                   // ~34-36 inches (used for shot planning)
+/** Real net height across the court: 36 in at the posts (1 ft outside the sidelines), 34 in at the centre. */
+const netTopAt = (x: number) => 34 / 12 + (36 / 12 - 34 / 12) * Math.min(1, ((x - COURT_W / 2) / (COURT_W / 2 + 1)) ** 2);
 const G = 32;                        // gravity, ft/s^2
 const BOUNCE_Z = 0.55;               // vertical restitution
 const BOUNCE_XY = 0.82;              // horizontal speed kept on bounce
@@ -44,11 +50,12 @@ const HYPER_COLOR = '#7cf2ff';
 const HYPER_SPARKS = ['#7cf2ff', '#19b7d6', '#d7f23b', '#ffffff'];
 
 const PLAYER_SPEED = 19.5;           // ft/s at full stick (was 15: felt sluggish on phones)
-const REACH = 3.9;           // furthest the player can reach the ball (ft); a step + lunge covers it
+const REACH = 4.2;           // furthest the player can reach the ball (ft); a step + lunge covers it
+const NET_REACH_BONUS = 0.8; // online: extra reach for other people's players (their position is a little old)
 const CONTACT_IDEAL = 1.3;   // body-to-ball distance where the paddle meets the ball
 const SWING_WINDOW = 0.25;   // a tap with no ball coming: a quick practice swing
-const SHOT_BUFFER = 1.1;     // a tap while the ball is coming: the shot waits this long for the ball
-const RECEIVE_ASSIST = 7;    // ft/s of gentle sideways help toward the contact spot while a shot waits
+const SHOT_BUFFER = 1.4;     // a tap while the ball is coming: once it's on your side, the shot waits this long
+const RECEIVE_ASSIST = 10;   // ft/s of gentle sideways help toward the contact spot while a shot waits
 const WIN_SCORE = 11;
 const X_MIN = -3, X_MAX = COURT_W + 3; // keeps everyone clear of the referee stands
 
@@ -66,6 +73,30 @@ const DIFFICULTY: Record<Difficulty, Skill> = {
   hard: { speed: 14.5, error: 0.85, reaction: 0.13, smart: 0.9, reach: 3.3, home: 8.6 },
 };
 const PARTNER_SKILL: Skill = { speed: 13, error: 1.2, reaction: 0.2, smart: 0.75, reach: 3.2, home: 9 };
+
+// ---------- computer players' personalities (arcade flavour) ----------
+// Each CPU player gets a style for the match: which shots it likes, how fast it is,
+// how quickly it reacts and how many risks it takes. Difficulty still sets the base
+// skill; the style decides HOW the bot plays, so no two matches feel the same.
+interface BotStyle {
+  title: string;
+  drive: number; dink: number; lob: number; // shot preferences (multipliers)
+  angle: number;  // chance to go for a sharp sideline angle
+  body: number;   // chance to drive straight at an opponent at the net
+  speed: number; react: number; risk: number; // movement, reaction time, error multipliers
+  home: number;   // feet further from (+) or closer to (-) the net than usual
+  smashAt: number; // lowest ball height it will try to smash
+}
+const BOT_STYLES: BotStyle[] = [
+  { title: 'POWER HITTER', drive: 1.6, dink: 0.5, lob: 0.5, angle: 0.2, body: 0.4, speed: 1.0, react: 0.9, risk: 1.25, home: -0.5, smashAt: 4.0 },
+  { title: 'SOFT TOUCH', drive: 0.7, dink: 1.8, lob: 0.6, angle: 0.4, body: 0.1, speed: 1.0, react: 1.0, risk: 0.8, home: -1.4, smashAt: 4.8 },
+  { title: 'MOONBALLER', drive: 0.9, dink: 0.8, lob: 2.8, angle: 0.2, body: 0.1, speed: 1.05, react: 1.0, risk: 1.0, home: 1.8, smashAt: 4.6 },
+  { title: 'SPEED DEMON', drive: 1.1, dink: 1.0, lob: 0.8, angle: 0.45, body: 0.2, speed: 1.2, react: 0.8, risk: 1.1, home: 0, smashAt: 4.4 },
+  { title: 'ALL-ROUNDER', drive: 1.0, dink: 1.0, lob: 1.0, angle: 0.3, body: 0.25, speed: 1.06, react: 0.95, risk: 0.95, home: 0, smashAt: 4.4 },
+];
+const STEADY_STYLE = BOT_STYLES[4];
+/** How fast CPU players charge Hyper (Easy bots never use it). */
+const BOT_HYPER_RATE: Record<Difficulty, number> = { easy: 0, medium: 0.6, hard: 0.9 };
 
 // ---------- helpers ----------
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
@@ -114,6 +145,11 @@ function buzz(ms: number | number[]): void {
 // =====================================================================
 interface Pose { hand: number[]; off: number[]; crouch: number; lean: number; stance: number; turn: number; step: number[] }
 interface Plan { x: number; y: number; t: number; gap: number }
+/** Hyper meter (one per human player). */
+interface Energy { value: number; hyperT: number; denied: number; fullPulse: number; auraT: number }
+const newEnergy = (): Energy => ({ value: 0, hyperT: 0, denied: 0, fullPulse: 0, auraT: 0 });
+/** Online: what a remote player reported (host) / where the host says they are (guest). */
+interface NetAth { x: number; y: number; aim: -1 | 0 | 1; have: boolean; gen: number; last: number }
 interface Athlete {
   id: string; team: Team; human: boolean;
   name: string; avatar: Avatar; paddle: string;
@@ -129,6 +165,10 @@ interface Athlete {
   mvx?: number; mvy?: number;
   loco?: number; runFrac?: number; latFrac?: number; dirX?: number; dirW?: number; gait?: number;
   vis?: Pose;
+  en: Energy;          // Hyper meter
+  style: BotStyle;     // CPU players: how they play this match
+  seat: number;        // online seat (0 = host); -1 offline
+  net: NetAth | null;  // online: another person's athlete
 }
 interface Ball {
   x: number; y: number; z: number; vx: number; vy: number; vz: number;
@@ -157,6 +197,50 @@ export interface MatchResult {
 }
 
 export interface BannerState { id: number; title: string; msg: string; kind: 'good' | 'bad' | ''; show: boolean }
+
+/** An online match in progress (null when playing the CPU). */
+export interface OnlineUi {
+  role: 'host' | 'guest';
+  opponent: string;
+  /** playing | waiting: the other player's messages stopped | ended: the match is over */
+  link: 'playing' | 'waiting' | 'ended';
+  /** The ☰ Menu over an online match (Resume / Leave match). */
+  menuOpen: boolean;
+  /** Shown while waiting / after the match (e.g. "Saving result…", "+16 rating"). */
+  note: string;
+}
+
+/** Final result of an online match as seen by this player (what the server is sent). */
+export interface OnlineMatchEnd {
+  hostScore: number;   // team A (the host's side)
+  guestScore: number;  // team B
+  longestRally: number;
+  rallies: RallyW[];
+}
+
+/** What the host saves after every rally so a restarted app can resume the match. */
+export interface OnlineResume {
+  score: [number, number];   // team A, team B
+  server: TeamW;
+  serverSeat: number;
+  serverNum: number;
+  courts: string[];          // per seat
+  energy: number[];          // per seat (Hyper itself isn't carried over)
+  rallies: RallyW[];
+  clock: number;
+  longestRally: number;
+}
+
+export interface OnlineStart {
+  role: 'host' | 'guest';
+  mode: Mode;
+  /** Your seat: 0 = host (team A), 1 = team B, 2 = team A, 3 = team B. */
+  seat: number;
+  send: (m: HostMsg | GuestMsg) => void;
+  /** Everyone else in the match and their look. */
+  others: { seat: number; look: Look }[];
+  resume?: OnlineResume | null;
+}
 export interface UiState {
   loading: boolean;
   loader: { progress: number; status: string; tip: string; done: boolean };
@@ -176,6 +260,7 @@ export interface UiState {
   banner: BannerState;
   gameOver: { title: string; score: string; stats: string };
   profile: Profile;
+  online: OnlineUi | null;
 }
 
 export const LOAD_TIPS = [
@@ -228,6 +313,7 @@ export function createGame() {
     banner: { id: 0, title: '', msg: '', kind: '', show: false },
     gameOver: { title: '', score: '', stats: '' },
     profile: defaultProfile(),
+    online: null,
   };
   function setUi(patch: Partial<UiState>): void {
     ui = { ...ui, ...patch };
@@ -248,6 +334,7 @@ export function createGame() {
       swing: 0, swingType: 'drive', // human swing window
       plan: null, reactT: 0, skill: DIFFICULTY.medium, // bots
       court: 'R',
+      en: newEnergy(), style: STEADY_STYLE, seat: -1, net: null,
     };
   }
   const player = makeAthlete('you', 'player', true, { ...ui.profile });
@@ -270,6 +357,13 @@ export function createGame() {
     'Thomas', 'Moore', 'Martin', 'Lee', 'Walker', 'Hall', 'Young', 'King', 'Wright', 'Scott', 'Green', 'Baker', 'Nelson',
     'Carter', 'Rivera', 'Cruz', 'Reyes', 'Santos', 'Kim', 'Nguyen', 'Patel', 'Rossi', 'Silva', 'Tanaka', 'Murphy',
     'Bennett', 'Hughes', 'Foster', 'Morgan', 'Reed', 'Ramos', 'Bautista'];
+
+  // Give each CPU opponent a different playing style for the match (your partner plays steady)
+  function assignBotStyles() {
+    const pool = BOT_STYLES.slice();
+    for (const b of [ai, ai2]) b.style = pool.splice((Math.random() * pool.length) | 0, 1)[0];
+    mate.style = STEADY_STYLE;
+  }
 
   // Give every computer player a different full name (called at the start of each game)
   function assignBotNames() {
@@ -294,10 +388,15 @@ export function createGame() {
     if (team === 'player') return mode === 'doubles' ? `${player.name} & ${mate.name}` : player.name;
     return mode === 'doubles' ? `${ai.name} & ${ai2.name}` : ai.name;
   }
-  // Short form for tight spaces (scoreboards)
+  // Short form for tight spaces (scoreboards): both partners' first names in doubles
   function teamShort(team: Team) {
-    if (team === 'player') return player.name;
+    if (team === 'player') return mode === 'doubles' ? `${firstName(player)} & ${firstName(mate)}` : player.name;
     return mode === 'doubles' ? `${firstName(ai)} & ${firstName(ai2)}` : ai.name;
+  }
+  // Scoreboard rows: "HANA / PIA" in doubles, the full name in singles
+  function boardName(team: Team) {
+    const [a, b] = team === 'player' ? [player, mate] : [ai, ai2];
+    return (mode === 'doubles' ? `${firstName(a)} / ${firstName(b)}` : a.name).toUpperCase();
   }
   const teamVerb = () => (mode === 'doubles' ? 'win' : 'wins');
 
@@ -319,6 +418,7 @@ export function createGame() {
   let gameWinner: Team | null = null;
 
   const score: Record<Team, number> = { player: 0, ai: 0 };
+  const streak = { team: null as Team | null, n: 0 }; // rallies won in a row
   let server: Team = 'player';    // serving team
   let serverAth: Athlete = player; // who is serving
   let serverNum = 1;        // doubles: 1st or 2nd server
@@ -335,6 +435,43 @@ export function createGame() {
 
   let landing: { x: number; y: number } | null = null;
   let trail: TrailPt[] = [];
+
+  // ---------- online play (see net.ts) ----------
+  // Seats: 0 = host (team A), 1 = team B, 2 = team A, 3 = team B (singles: 0 and 1).
+  // host: runs the match; other people's athletes move by their own reports.
+  // guest: draws the host's match (mirrored when on team B, so everyone plays from the
+  //        bottom of the screen); only its own movement is simulated here.
+  let netRole: 'off' | 'host' | 'guest' = 'off';
+  let netSend: ((m: HostMsg | GuestMsg) => void) | null = null;
+  let netHold = false;              // host: play waits while someone is away
+  let netClock = 0;                 // host: match time in ms (stops while waiting)
+  let snapT = 0, snapSeq = 0;       // host: snapshot timer
+  let mySeat = 0;
+  let myTeamW: TeamW = 0;           // 0 = team A (the host's side), 1 = team B
+  let seats: Athlete[] = [];        // online: the athlete in each seat
+  let rallyLog: RallyW[] = [];      // winning team of every rally ('h' team A / 'g' team B), in order
+  let lastRecv = 0;                 // guest: Date.now() of the last message from the host
+  let inT = 0, lastInKey = '', lastInSent = 0; // guest: position report throttle
+  let needLogAt = 0;                // guest: last time the rally log was requested
+  let guestPointsWon = 0;
+  let setupGen = 0;                 // counts serve setups (players are placed for each serve)
+  let seenGen = -1;                 // guest: last serve setup seen
+  let holdNames = '';               // host: who the match is waiting for
+  let holdT = 0;
+  const onlineEndListeners = new Set<(r: OnlineMatchEnd) => void>();
+  const rallyListeners = new Set<() => void>();
+  const isGuest = () => netRole === 'guest';
+  const mirrored = () => isGuest() && myTeamW === 1;
+  // wire team 0 = team A (the host's side), 1 = team B
+  const toW = (t: Team): TeamW => (t === 'player' ? myTeamW : ((1 - myTeamW) as TeamW));
+  const fromW = (w: TeamW): Team => (w === myTeamW ? 'player' : 'ai');
+  // wire coordinates are the host's; team B's players see them mirrored
+  const inX = (x: number) => (mirrored() ? COURT_W - x : x);
+  const inY = (y: number) => (mirrored() ? COURT_L - y : y);
+  const seatAth = (s: number): Athlete | null => (Number.isInteger(s) && s >= 0 && s < seats.length ? seats[s] : null);
+  function netEmit(e: MatchEvent) {
+    if (netRole === 'host' && netSend) netSend({ k: 'ev', e });
+  }
 
   // ---------- juice / effects ----------
   let clock = 0;
@@ -419,12 +556,19 @@ export function createGame() {
     ref.bubble = { text, t: 0, life: dur + 0.2, color: o.color || CALL_COLORS.info };
     if (o.whistle) sfx.whistle();
     say(o.speech || text, ref.pitch, o.interrupt !== false);
+    if (netRole === 'host') {
+      netEmit({
+        k: 'ref', r: ref === refs[0] ? 0 : 1, p: pose, x: text, c: o.color, d: o.dur, w: o.whistle, s: o.speech,
+        i: o.interrupt, tg: o.target ? [r2(o.target.x), r2(o.target.y)] : undefined,
+      });
+    }
   }
   // Head referee announcement that tacks onto a call they just made, if any.
   function headAnnounce(text: string, target: { x: number; y: number }) {
     if (headRef.bubble && headRef.bubble.t < 0.05) {
       headRef.bubble.text += ' ' + text;
       say(text, headRef.pitch);
+      netEmit({ k: 'refx', x: text });
     } else {
       refCall(headRef, 'point', text, { target, interrupt: false });
     }
@@ -585,7 +729,7 @@ export function createGame() {
     }
     if (best === 'hyper') {
       buttons.hyper.pressed = id;
-      activateHyper();
+      pressHyper();
       return;
     }
     if (best) {
@@ -617,6 +761,7 @@ export function createGame() {
 
   function autoPause() {
     releaseAllTouches();
+    if (netRole !== 'off') return; // an online match can't be paused; the other player waits instead
     if (state === 'serve' || state === 'rally' || state === 'point') togglePause();
   }
 
@@ -638,33 +783,58 @@ export function createGame() {
 
   function action(type: ShotType) {
     ensureAudio();
-    if (state === 'serve' && serverAth === player) {
-      playerServe();
-    } else if (state === 'rally') {
-      player.swingType = type;
-      const incoming = lastHitter !== 'player' && !ball.netted && !ball.held;
-      if (incoming) {
-        // Queue the shot: the player gets set and swings when the ball reaches the paddle
-        // (no need to time the tap to a fraction of a second, and never too early to be legal).
-        player.swing = SHOT_BUFFER;
-        player.queued = true;
-      } else {
-        player.swing = SWING_WINDOW; // nothing to hit: a quick practice swing
-        player.queued = false;
-        if (!player.stroke || player.strokeT > 0.7) startStroke(player, strokeKindFor(player, type), 0);
+    if (netRole === 'guest') { // the host plays the shot; show the waiting swing here at once
+      if (state === 'serve' && serverAth === player) netSend?.({ k: 'shot', ty: type, a: wireAim(aimDir()) });
+      else if (state === 'rally') {
+        queueSwing(player, type);
+        netSend?.({ k: 'shot', ty: type, a: wireAim(aimDir()) });
       }
+      return;
+    }
+    actionFor(player, type);
+  }
+
+  // A shot tap for a human athlete (you, or the guest's athlete on the host).
+  function actionFor(p: Athlete, type: ShotType) {
+    if (state === 'serve' && serverAth === p) {
+      humanServe(p);
+    } else if (state === 'rally') {
+      queueSwing(p, type);
     }
   }
 
+  function queueSwing(p: Athlete, type: ShotType) {
+    p.swingType = type;
+    const incoming = lastHitter !== p.team && !ball.netted && !ball.held;
+    if (incoming) {
+      // Queue the shot: the player gets set and swings when the ball reaches the paddle
+      // (no need to time the tap to a fraction of a second, and never too early to be legal).
+      p.swing = SHOT_BUFFER;
+      p.queued = true;
+    } else {
+      p.swing = SWING_WINDOW; // nothing to hit: a quick practice swing
+      p.queued = false;
+      if (!p.stroke || p.strokeT > 0.7) startStroke(p, strokeKindFor(p, type), 0);
+    }
+  }
+
+  // Your stick left/right on the host's court (flipped for team B, who see it mirrored).
+  const wireAim = (a: number): -1 | 0 | 1 => {
+    const s = a > 0 ? 1 : a < 0 ? -1 : 0;
+    return (mirrored() ? -s : s) as -1 | 0 | 1;
+  };
+  // Aim of a human athlete in this game's frame.
+  const aimOf = (p: Athlete) => (p === player ? aimDir() : p.net?.aim ?? 0);
+
   // Where (sideways) the player should stand so the incoming ball meets the paddle,
   // or null if it can't be worked out yet.
-  function contactSpotX(): number | null {
+  function contactSpotX(p: Athlete = player): number | null {
     if (ball.held || ball.netted || Math.abs(ball.vy) < 1) return null;
-    const lineY = player.y - 0.8;                    // just in front of the body
+    const lineY = p.y + (p.team === 'player' ? -0.8 : 0.8); // just in front of the body
     const t = (lineY - ball.y) / ball.vy;
     if (t < 0 || t > 1.3) return null;
     const bx = ball.x + ball.vx * t;
-    return bx - domSign(player) * CONTACT_IDEAL * 0.8; // ball on the paddle side
+    return bx - domSign(p) * CONTACT_IDEAL * 0.8; // ball on the paddle side
   }
 
   // =====================================================================
@@ -707,7 +877,7 @@ export function createGame() {
   // While the player is in Hyper mode every shot is faster, more accurate and lands
   // in tougher spots, and opponents struggle to return it.
   function doHit(hitter: Athlete, type: ShotType, tx: number, err: number, netty = false) {
-    const hyper = hitter === player && energy.hyperT > 0;
+    const hyper = hitter.en.hyperT > 0; // people, and CPU players on Medium / Hard
     const strokeKind = strokeKindFor(hitter, type); // decided from the ball as it arrives
     const toTop = hitter.team === 'player';
     const deep = (d: number) => (toTop ? d : COURT_L - d);          // d feet from target baseline
@@ -770,9 +940,16 @@ export function createGame() {
     if (!(hitter.stroke && hitter.strokeT < 0.6)) startStroke(hitter, strokeKind, 0.35);
     splitStep(other(hitter.team));
 
-    // ---- juice ----
+    if (!hyper) addEnergy(hitter, ENERGY_PER_HIT); // CPU players only charge on Medium / Hard
+    netEmit({ k: 'hit', s: hitter.seat, t: toW(hitter.team), ty: type, sk: strokeKind, sm: smash, hy: hyper,
+      p: [r2(hitX), r2(hitY), r2(hitZ)], b: packBall(ball), n: shots });
+    hitFx(hitter, type, smash, hyper, hitX, hitY, hitZ);
+    assignInterceptors();
+  }
+
+  // Sound, sparks and text for a hit (also played by the guest for the host's hits).
+  function hitFx(hitter: Athlete, type: ShotType, smash: boolean, hyper: boolean, hitX: number, hitY: number, hitZ: number) {
     const mine = hitter === player;
-    if (mine && !hyper) addEnergy(ENERGY_PER_HIT);
     if (smash) {
       sfx.smash();
       addShake(hyper ? 13 : 8);
@@ -799,41 +976,41 @@ export function createGame() {
       sparks(hitX, hitY, hitZ, 30, HYPER_SPARKS, 1.8);
     }
     if (shots === 10) floatText(10, NET_Y, 'EPIC RALLY!', '#d7f23b', 1.3);
-
-    assignInterceptors();
   }
 
-  function playerHit(type: ShotType) {
-    const aim = aimDir();
+  // A human athlete's shot (aim comes from the stick, or the guest's reported stick).
+  function humanHit(p: Athlete, type: ShotType) {
+    const aim = aimOf(p);
     let tx: number;
     if (aim !== 0) tx = type === 'dink' ? 10 + aim * 6 : (aim > 0 ? COURT_W - 2 : 2);
-    else tx = clamp(player.x, 3, COURT_W - 3);
-    const dx = ball.x - player.x, dy = ball.y - player.y;
+    else tx = clamp(p.x, 3, COURT_W - 3);
+    const dx = ball.x - p.x, dy = ball.y - p.y;
     const d = Math.hypot(dx, dy);
     const reachUsed = clamp((d - 0.8) / (REACH - 0.8), 0, 1);
     const err = 0.6 + 0.9 * reachUsed; // sloppier at full stretch
     // Step and reach toward the ball so the paddle meets it (like a real player lunging)
     const excess = d - CONTACT_IDEAL;
-    if (excess > 0.05 && d > 0) {
+    if (excess > 0.05 && d > 0 && p === player) {
       const LUNGE_T = 0.12;
-      player.lungeT = LUNGE_T;
-      player.lungeVX = ((dx / d) * excess * 0.85) / LUNGE_T;
-      player.lungeVY = ((dy / d) * excess * 0.85) / LUNGE_T;
+      p.lungeT = LUNGE_T;
+      p.lungeVX = ((dx / d) * excess * 0.85) / LUNGE_T;
+      p.lungeVY = ((dy / d) * excess * 0.85) / LUNGE_T;
     }
-    doHit(player, type, tx, err);
+    doHit(p, type, tx, err);
     // swing timed so the paddle is at the ball now (contact is ~45% through the stroke)
-    startStroke(player, strokeKindFor(player, type), 0.4);
+    startStroke(p, strokeKindFor(p, type), 0.4);
   }
 
-  function playerServe() {
+  function humanServe(p: Athlete) {
     if (!serveBox) return;
-    const aim = aimDir();
+    const aim = aimOf(p);
     const cx = (serveBox.x0 + serveBox.x1) / 2;
     const tx = cx + aim * 3.2 + randn() * 0.8;
-    const ty = rand(2.5, 6) + randn() * 0.8;
+    const depth = rand(2.5, 6) + randn() * 0.8;
+    const ty = p.team === 'player' ? depth : COURT_L - depth;
     launch(tx, ty, rand(1.05, 1.2));
-    beginRallyFromServe(player);
-    buzz(15);
+    beginRallyFromServe(p);
+    if (p === player) buzz(15);
   }
 
   function botServe(b: Athlete) {
@@ -851,14 +1028,25 @@ export function createGame() {
     lastHitter = who.team;
     shots = 1;
     bounces = 0;
+    netEmit({ k: 'serve', s: who.seat, t: toW(who.team), b: packBall(ball) });
+    serveFx(who);
+    assignInterceptors();
+    syncState();
+  }
+
+  function serveFx(who: Athlete) {
     startStroke(who, 'serve', 0.42);
     splitStep(other(who.team));
     landing = predictLanding();
     sfx.hit();
     sparks(ball.x, ball.y, ball.z, 8, ['#ffffff', '#e8f53b'], 0.6);
     hideBanner();
-    assignInterceptors();
-    syncState();
+  }
+
+  // Line calls and points shown as floating text (sent to the guest as well).
+  function callText(x: number, y: number, text: string, color: string, size = 1) {
+    floatText(x, y, text, color, size);
+    netEmit({ k: 'float', x: r2(x), y: r2(y), tx: text, c: color, s: size });
   }
 
   function stepBall(dt: number) {
@@ -874,7 +1062,7 @@ export function createGame() {
     if (!ball.netted && (prevY - NET_Y) * (ball.y - NET_Y) < 0 && ball.x > -1 && ball.x < COURT_W + 1) {
       const f = (NET_Y - prevY) / (ball.y - prevY);
       const zc = prevZ + (ball.z - prevZ) * f;
-      if (zc < NET_H) {
+      if (zc < netTopAt(ball.x)) {
         ball.netted = true;
         ball.y = NET_Y + (prevY < NET_Y ? -0.3 : 0.3);
         ball.vy *= -0.15;
@@ -886,7 +1074,7 @@ export function createGame() {
         net.x = ball.x;
         addShake(4);
         floatText(ball.x, NET_Y, 'NET', '#ff7b7b');
-        if (state === 'rally') {
+        if (state === 'rally' && !isGuest()) { // the host decides points; the guest only shows the ball
           refCall(nearRef(ball.x), 'fault', 'Net!', { target: ball, color: CALL_COLORS.warn });
           endRally(other(lastHitter as Team), 'Into the net');
         }
@@ -922,7 +1110,7 @@ export function createGame() {
 
   function onBounce() {
     landing = null;
-    if (state !== 'rally') return;
+    if (state !== 'rally' || isGuest()) return;
 
     bounces++;
     const receiver = other(lastHitter as Team);
@@ -938,7 +1126,7 @@ export function createGame() {
         const b = serveBox as Box;
         if (!inBox(b, ball.x, ball.y)) {
           const kitchenLand = ball.y > TOP_KITCHEN && ball.y < BOT_KITCHEN && ball.x >= 0 && ball.x <= COURT_W;
-          floatText(ball.x, ball.y, 'FAULT', '#ff7b7b');
+          callText(ball.x, ball.y, 'FAULT', '#ff7b7b');
           if (kitchenLand) {
             refCall(ref, 'kitchen', 'Fault — in the kitchen!', { target: spot, color: CALL_COLORS.warn, speech: 'Fault! Kitchen.', whistle: true });
           } else {
@@ -949,7 +1137,7 @@ export function createGame() {
           refCall(ref, 'in', 'Inside!', { target: spot, color: CALL_COLORS.in });
         }
       } else if (!inCourt(ball.x, ball.y)) {
-        floatText(ball.x, ball.y, 'OUT', '#ff7b7b');
+        callText(ball.x, ball.y, 'OUT', '#ff7b7b');
         refCall(ref, 'out', pick(['Out!', "It's out!", 'Outside!']), { target: spot, color: CALL_COLORS.out });
         endRally(receiver, 'Out!');
       } else {
@@ -959,13 +1147,14 @@ export function createGame() {
         }
       }
     } else {
-      endRally(lastHitter as Team, receiver === 'player' ? 'Missed it' : `${teamShort('ai')} missed it`);
+      endRally(lastHitter as Team, missedText(receiver), receiver);
     }
   }
+  const missedText = (by: Team) => (by === 'player' ? 'Missed it' : `${teamShort('ai')} missed it`);
 
   // (The player never faults by tapping early: a waiting shot holds until it is legal.)
 
-  function endRally(winner: Team, reason: string) {
+  function endRally(winner: Team, reason: string, missedBy: Team | null = null) {
     if (state !== 'rally') return;
     state = 'point';
     stateTimer = 1.7;
@@ -974,9 +1163,10 @@ export function createGame() {
     const wc = teamCenter(winner);
 
     // Unreturned serve = ace
-    if (shots === 1 && winner === lastHitter && bounces >= 2) {
+    const ace = shots === 1 && winner === lastHitter && bounces >= 2;
+    if (ace) {
       reason = 'Ace!';
-      floatText(serverAth.x, serverAth.y, 'ACE!', '#d7f23b', 1.3);
+      callText(serverAth.x, serverAth.y, 'ACE!', '#d7f23b', 1.3);
       refCall(headRef, 'point', 'Ace!', { target: serverAth, color: CALL_COLORS.in, interrupt: false });
     }
 
@@ -1004,22 +1194,44 @@ export function createGame() {
       headAnnounce('Side out!', wc);
     }
 
-    for (const a of teamOf(winner)) {
-      a.jump = 1;
-      a.cheer = 1.3; // both arms up
-      sparks(a.x, a.y, 2.5, 10, winner === 'player' ? ['#3aa0ff', '#9fd2ff', '#ffffff'] : ['#ff5d5d', '#ffb0b0', '#ffffff'], 0.8);
+    if (winner === 'player') pointsWon++;
+    // runs of points: "ON FIRE!" after three in a row
+    if (streak.team === winner) streak.n++; else { streak.team = winner; streak.n = 1; }
+    if (streak.n === 3 || streak.n === 6) {
+      const c = teamCenter(winner);
+      callText(c.x, c.y, streak.n >= 6 ? 'UNSTOPPABLE!' : 'ON FIRE!', '#ff7b3a', 1.3);
     }
-    if (winner === 'player') { pointsWon++; sfx.good(); buzz(25); addEnergy(ENERGY_PER_POINT); } else { sfx.bad(); buzz([20, 60, 20]); }
-
-    showBanner(reason, msg, winner === 'player' ? 'good' : 'bad');
+    for (const a of teamOf(winner)) if (!a.human) addEnergy(a, ENERGY_PER_POINT);
+    for (const a of teamOf(winner)) if (a.human) addEnergy(a, ENERGY_PER_POINT);
 
     const lead = score[server] - score[other(server)];
     if (score[server] >= WIN_SCORE && lead >= 2) {
       gameWinner = server;
       stateTimer = 2.0;
-      if (gameWinner === 'player') confettiBurst(80);
     }
+
+    if (netRole === 'host') {
+      rallyLog.push({ w: winner === 'player' ? 'h' : 'g', t: Math.round(netClock) });
+      netEmit({
+        k: 'point', w: toW(winner), r: reason, mb: missedBy ? toW(missedBy) : -1, m: msg,
+        i: rallyLog.length - 1, ts: Math.round(netClock), ace, gw: gameWinner ? toW(gameWinner) : -1,
+      });
+      rallyListeners.forEach(fn => { try { fn(); } catch { /* never breaks the game */ } });
+    }
+    pointFx(winner, reason, msg);
     syncState();
+  }
+
+  // Celebration, sounds and the banner for a finished rally.
+  function pointFx(winner: Team, reason: string, msg: string) {
+    for (const a of teamOf(winner)) {
+      a.jump = 1;
+      a.cheer = 1.3; // both arms up
+      sparks(a.x, a.y, 2.5, 10, winner === 'player' ? ['#3aa0ff', '#9fd2ff', '#ffffff'] : ['#ff5d5d', '#ffb0b0', '#ffffff'], 0.8);
+    }
+    if (winner === 'player') { sfx.good(); buzz(25); } else { sfx.bad(); buzz([20, 60, 20]); }
+    showBanner(reason, msg, winner === 'player' ? 'good' : 'bad');
+    if (gameWinner === 'player') confettiBurst(80);
   }
 
   // =====================================================================
@@ -1038,11 +1250,16 @@ export function createGame() {
     ball.g = G;
     ball.held = true;
     ball.vx = ball.vy = ball.vz = 0;
-    player.swing = 0;
-    player.queued = false;
-    player.lungeT = 0;
-    player.mvx = player.mvy = 0;
+    for (const a of roster) {
+      if (!a.human) continue;
+      a.swing = 0;
+      a.queued = false;
+      a.lungeT = 0;
+      a.mvx = a.mvy = 0;
+    }
     interceptor.player = interceptor.ai = null;
+    setupGen++;
+    netEmit({ k: 'setup' });
 
     // Singles: serve from the right when the server's score is even.
     // Doubles: players stay in their courts (they switch after winning a point).
@@ -1198,59 +1415,107 @@ export function createGame() {
   const ENERGY_PER_HIT = 7;      // each ball you hit
   const ENERGY_PER_POINT = 12;   // each rally your team wins
   const HYPER_SECONDS = 5;
-  const energy = { value: 0, hyperT: 0, denied: 0, fullPulse: 0, auraT: 0 };
+  // One meter per human player. Against the CPU only yours is used.
+  const energy = player.en; // your bar (drawn in the HUD and on the HYPER button)
+  // humans whose meter runs: just you vs the CPU; everyone online
+  const botHyperRate = () => (netRole === 'off' ? BOT_HYPER_RATE[ui.difficulty] : 0);
+  const meterHolders = () => (netRole === 'off'
+    ? [player, ...(botHyperRate() > 0 ? roster.filter(a => !a.human) : [])]
+    : roster.filter(a => a.human));
 
-  function resetEnergy() { energy.value = 0; energy.hyperT = 0; energy.denied = 0; energy.fullPulse = 0; }
+  function resetEnergy() {
+    for (const a of [player, mate, ai, ai2]) { const e = a.en; e.value = 0; e.hyperT = 0; e.denied = 0; e.fullPulse = 0; }
+  }
 
-  function addEnergy(n: number) {
-    if (energy.value >= 100 || energy.hyperT > 0) return; // no charging while Hyper burns
-    energy.value = Math.min(100, energy.value + n);
-    if (energy.value >= 100) { // just became full
-      energy.fullPulse = 1;
-      sfx.full();
-      floatText(player.x, player.y, 'HYPER READY', HYPER_COLOR, 1);
-      buzz(30);
+  function addEnergy(a: Athlete, n: number) {
+    const e = a.en;
+    if (e.value >= 100 || e.hyperT > 0) return; // no charging while Hyper burns
+    const rate = a.human ? 1 : botHyperRate(); // CPU players charge slower (Easy: never)
+    if (rate <= 0) return;
+    e.value = Math.min(100, e.value + n * rate);
+    if (e.value >= 100) { // just became full
+      netEmit({ k: 'hyper', s: a.seat, a: 'ready' });
+      hyperReadyFx(a);
     }
   }
 
-  function activateHyper() {
+  function hyperReadyFx(a: Athlete) {
+    if (a !== player) return; // only your own bar announces itself
+    energy.fullPulse = 1;
+    sfx.full();
+    floatText(player.x, player.y, 'HYPER READY', HYPER_COLOR, 1);
+    buzz(30);
+  }
+
+  // The HYPER button.
+  function pressHyper() {
     ensureAudio();
     // Works during rallies, while waiting to serve and in the short pause after a point
     if (!(state === 'rally' || state === 'serve' || state === 'point')) return;
-    if (energy.hyperT > 0) return;
-    if (energy.value < 100) { // not charged: no effect, just feedback
-      energy.denied = 0.45;
-      sfx.deny();
-      buzz(20);
+    if (netRole === 'guest') { // the host switches it on and tells us
+      if (energy.hyperT > 0) return;
+      if (energy.value < 100) { hyperDeniedFx(); return; }
+      netSend?.({ k: 'hyper' });
       return;
     }
-    energy.hyperT = HYPER_SECONDS;
+    activateHyper(player);
+  }
+
+  function activateHyper(a: Athlete) {
+    if (!(state === 'rally' || state === 'serve' || state === 'point')) return;
+    const e = a.en;
+    if (e.hyperT > 0) return;
+    if (e.value < 100) { // not charged: no effect, just feedback
+      if (a === player) hyperDeniedFx();
+      return;
+    }
+    e.hyperT = HYPER_SECONDS;
+    netEmit({ k: 'hyper', s: a.seat, a: 'on' });
+    hyperOnFx(a);
+  }
+
+  function hyperDeniedFx() {
+    energy.denied = 0.45;
+    sfx.deny();
+    buzz(20);
+  }
+
+  function hyperOnFx(a: Athlete) {
     sfx.charge();
     sfx.power();
     addShake(6);
-    flash = 0.35;
-    floatText(player.x, player.y, 'HYPER MODE!', HYPER_COLOR, 1.3);
-    sparks(player.x, player.y, 3, 30, HYPER_SPARKS, 1.1);
-    buzz([30, 20, 50]);
+    if (a === player) { flash = 0.35; buzz([30, 20, 50]); }
+    floatText(a.x, a.y, 'HYPER MODE!', HYPER_COLOR, 1.3);
+    sparks(a.x, a.y, 3, 30, HYPER_SPARKS, 1.1);
+  }
+
+  function hyperOverFx(a: Athlete) {
+    floatText(a.x, a.y, 'HYPER OVER', '#9fb0c3', 0.9);
   }
 
   function updateEnergy(dt: number) {
-    if (energy.hyperT > 0) {
-      energy.hyperT = Math.max(0, energy.hyperT - dt);
-      energy.value = (100 * energy.hyperT) / HYPER_SECONDS; // the bar drains as Hyper runs out
-      energy.auraT -= dt;
-      if (energy.auraT <= 0) { // electric sparks rising around the player
-        energy.auraT = 0.04;
-        spawn({ kind: 'spark', x: player.x + rand(-0.8, 0.8), y: player.y + rand(-0.4, 0.4), z: rand(0.2, 1.8),
-          vx: rand(-1, 1), vy: rand(-1, 1), vz: rand(6, 12), g: 4, life: rand(0.3, 0.5), size: rand(2, 3.5),
-          color: pick(HYPER_SPARKS) });
+    for (const a of meterHolders()) {
+      const e = a.en;
+      if (e.hyperT > 0) {
+        e.hyperT = Math.max(0, e.hyperT - dt);
+        e.value = (100 * e.hyperT) / HYPER_SECONDS; // the bar drains as Hyper runs out
+        e.auraT -= dt;
+        if (e.auraT <= 0) { // electric sparks rising around the player
+          e.auraT = 0.04;
+          spawn({ kind: 'spark', x: a.x + rand(-0.8, 0.8), y: a.y + rand(-0.4, 0.4), z: rand(0.2, 1.8),
+            vx: rand(-1, 1), vy: rand(-1, 1), vz: rand(6, 12), g: 4, life: rand(0.3, 0.5), size: rand(2, 3.5),
+            color: pick(HYPER_SPARKS) });
+        }
+        if (e.hyperT <= 0) {
+          e.value = 0;
+          if (!isGuest()) { // guests hear about it from the host
+            netEmit({ k: 'hyper', s: a.seat, a: 'over' });
+            hyperOverFx(a);
+          }
+        }
+      } else if (state === 'rally' && !isGuest()) {
+        addEnergy(a, ENERGY_PER_SECOND * dt);
       }
-      if (energy.hyperT <= 0) {
-        energy.value = 0;
-        floatText(player.x, player.y, 'HYPER OVER', '#9fb0c3', 0.9);
-      }
-    } else if (state === 'rally') {
-      addEnergy(ENERGY_PER_SECOND * dt);
     }
     energy.denied = Math.max(0, energy.denied - dt);
     energy.fullPulse = Math.max(0, energy.fullPulse - dt * 1.5);
@@ -1264,7 +1529,7 @@ export function createGame() {
     const k = 1 - Math.exp(-dt * (moving ? 30 : 32));
     player.mvx = (player.mvx || 0) + (tvx - (player.mvx || 0)) * k;
     player.mvy = (player.mvy || 0) + (tvy - (player.mvy || 0)) * k;
-    if (player.swing > 0) player.swing -= dt;
+    tickSwing(player, dt);
 
     if (state === 'serve' && serverAth === player) {
       player.y = behindBaseline('player');
@@ -1293,27 +1558,61 @@ export function createGame() {
     player.x = clamp(player.x + mx, X_MIN, X_MAX);
     player.y = clamp(player.y + my, NET_Y + 0.6, COURT_L + 5.5);
 
-    // Connect with the ball while a shot is waiting (or during a practice swing)
-    if (state !== 'rally' || player.swing <= 0 || lastHitter === 'player' || ball.held || ball.netted) return;
-    if (sideOf(ball.y) !== 'player') return;
+    if (!isGuest()) tryConnect(player); // the guest's shots are played by the host
+  }
+
+  // A shot tapped early holds while the ball is still on its way over (or has yet to
+  // bounce for the two-bounce rule); its time only runs once the ball can be hit.
+  // (Before, an early tap on a lob or a deep return could run out before the ball arrived.)
+  function tickSwing(p: Athlete, dt: number) {
+    if (p.swing <= 0) return;
+    const waitingForBall = !!p.queued && state === 'rally' && lastHitter !== p.team && !ball.netted && !ball.held
+      && (sideOf(ball.y) !== p.team || (bounces === 0 && shots < 3));
+    if (!waitingForBall) p.swing -= dt;
+  }
+
+  // Connect with the ball while a shot is waiting (or during a practice swing).
+  function tryConnect(p: Athlete) {
+    if (state !== 'rally' || p.swing <= 0 || lastHitter === p.team || ball.held || ball.netted) return;
+    if (sideOf(ball.y) !== p.team) return;
     // Never fault on an early tap: a waiting shot holds until it's legal to hit
-    if (bounces === 0 && shots < 3) return;                       // two-bounce rule: let it bounce
-    if (bounces === 0 && inKitchen('player', player.y)) return;  // no volleys in the kitchen
-    const d = Math.hypot(ball.x - player.x, ball.y - player.y);
-    if (d > REACH || ball.z > 7.5) return;
+    if (bounces === 0 && shots < 3) return;                     // two-bounce rule: let it bounce
+    if (bounces === 0 && inKitchen(p.team, p.y)) return;       // no volleys in the kitchen
+    const d = Math.hypot(ball.x - p.x, ball.y - p.y);
+    if (d > REACH + (p.net ? NET_REACH_BONUS : 0) || ball.z > 7.5) return;
 
     // Best moment: when the ball is as close to the paddle as it will get. Hold on while it
     // is still coming closer, unless it's about to bounce a second time or time runs out.
     const look = 0.05;
-    const dNext = Math.hypot(ball.x + ball.vx * look - player.x, ball.y + ball.vy * look - player.y);
+    const dNext = Math.hypot(ball.x + ball.vx * look - p.x, ball.y + ball.vy * look - p.y);
     const closing = dNext < d - 0.03;
     const secondBounceSoon = bounces >= 1 && ball.z < 0.45 && ball.vz < 0;
-    const lastChance = player.swing < 0.06;
+    const lastChance = p.swing < 0.06;
     if (closing && d > CONTACT_IDEAL && !secondBounceSoon && !lastChance) return;
 
-    player.swing = 0;
-    player.queued = false;
-    playerHit(player.swingType);
+    p.swing = 0;
+    p.queued = false;
+    humanHit(p, p.swingType);
+  }
+
+  // Host: another person's athlete follows their own reports of where they are, at
+  // no more than a fast run (a modified app can't teleport), kept on their side of
+  // the net, and plays their queued shots by the same rules as yours.
+  // Room to catch up after reports arrive in a bunch (phone networks deliver unevenly),
+  // while still far too slow to teleport.
+  const REMOTE_MAX_SPEED = PLAYER_SPEED * 2.5;
+  function updateRemote(a: Athlete, dt: number) {
+    const n = a.net as NetAth;
+    tickSwing(a, dt);
+    const current = n.have && n.gen === setupGen; // ignore reports from before this serve's setup
+    if (state === 'serve' && serverAth === a) {
+      a.y = behindBaseline(a.team);
+      if (current) a.x = clamp(n.x, serveHalf[0] + 0.5, serveHalf[1] - 0.5);
+      holdBallFor(a);
+      return;
+    }
+    if (current) moveToward(a, clamp(n.x, X_MIN, X_MAX), clampOwnY(a.team, n.y), REMOTE_MAX_SPEED, dt);
+    tryConnect(a);
   }
 
   // =====================================================================
@@ -1352,7 +1651,7 @@ export function createGame() {
         if (Math.abs(y - sy) > sk.reach * 0.8) continue;
       }
       sy = clampOwnY(own, sy);
-      const need = Math.max(0, Math.hypot(sx - bot.x, sy - bot.y) - 0.6) / sk.speed + sk.reaction;
+      const need = Math.max(0, Math.hypot(sx - bot.x, sy - bot.y) - 0.6) / (sk.speed * bot.style.speed) + sk.reaction * bot.style.react;
       const cand = { x: sx, y: sy, t, gap: need - t };
       if (need <= t) return cand;
       if (!fallback || cand.gap < fallback.gap) fallback = cand;
@@ -1369,7 +1668,8 @@ export function createGame() {
     const bots = teamOf(recv).filter(a => !a.human);
     for (const b of bots) {
       b.plan = computePlan(b);
-      b.reactT = b.skill.reaction + (ball.power ? 0.1 : 0); // a power smash is harder to read
+      // reaction varies shot to shot (keeps bots from feeling robotic); a power shot is harder to read
+      b.reactT = b.skill.reaction * b.style.react * rand(0.75, 1.25) * (comeback(b.team) ? 0.85 : 1) + (ball.power ? 0.1 : 0);
     }
     if (!bots.length) return;
 
@@ -1389,7 +1689,7 @@ export function createGame() {
   function homeFor(b: Athlete) {
     // The serving team stays back until the return has bounced (two-bounce rule)
     const mustBack = b.team === server && shots < 3 && state === 'rally';
-    const y = mustBack ? behindBaseline(b.team) : ownY(b.team, b.skill.home);
+    const y = mustBack ? behindBaseline(b.team) : ownY(b.team, clamp(b.skill.home + b.style.home, KITCHEN + 0.6, 19));
     let x: number;
     if (mode === 'singles') {
       x = 10 + (ball.x - 10) * 0.45;
@@ -1400,8 +1700,20 @@ export function createGame() {
     return { x, y };
   }
 
+  // Weighted random pick: { drive: 2, dink: 1 } -> 'drive' two times in three.
+  function pickWeighted(w: Record<ShotType, number>): ShotType {
+    const entries = (Object.keys(w) as ShotType[]).map(k => [k, Math.max(0, w[k])] as const);
+    let r = Math.random() * entries.reduce((s, [, v]) => s + v, 0);
+    for (const [k, v] of entries) { if ((r -= v) <= 0) return k; }
+    return 'drive';
+  }
+
+  // The bot's team is far behind: it digs in (reacts faster, fewer errors).
+  const comeback = (team: Team) => score[other(team)] - score[team] >= 4;
+
   function botChooseShot(bot: Athlete) {
     const sk = bot.skill;
+    const st = bot.style;
     const nearNet = Math.abs(bot.y - NET_Y) < 13;
     const lowBall = ball.z < 2.6;
     const opps = teamOf(other(bot.team));
@@ -1409,29 +1721,45 @@ export function createGame() {
     const oppsUp = opps.some(o => Math.abs(o.y - NET_Y) < 9);
     let type: ShotType;
 
-    if (ball.z > 5) type = 'drive';                                        // smash it
-    else if (shots === 1) type = Math.random() < 0.85 ? 'drive' : 'lob';    // return of serve: go deep
-    else if (shots === 2) type = Math.random() < sk.smart ? 'dink' : 'drive'; // third-shot drop
-    else if (nearNet && lowBall) type = Math.random() < sk.smart * 0.9 ? 'dink' : 'drive';
-    else if (oppsBack) type = Math.random() < sk.smart * 0.6 ? 'dink' : 'drive';
-    else type = Math.random() < 0.3 ? 'dink' : 'drive';
+    if (ball.z > st.smashAt && shots >= 2 && Math.random() < 0.55 + sk.smart * 0.4) type = 'smash'; // put it away
+    else if (shots === 1) type = pickWeighted({ drive: 4 * st.drive, lob: 0.7 * st.lob, dink: 0.2 * st.dink, smash: 0 }); // return: deep
+    else if (shots === 2) type = pickWeighted({ dink: 3 * sk.smart * st.dink, drive: 2 * (1 - sk.smart * 0.5) * st.drive, lob: 0.3 * st.lob, smash: 0 }); // third shot
+    else if (nearNet && lowBall) type = pickWeighted({ dink: 3 * st.dink, drive: 1 * st.drive, lob: 0.35 * st.lob, smash: 0 }); // kitchen battle
+    else if (oppsUp) type = pickWeighted({ drive: 1.6 * st.drive, lob: 1.1 * st.lob, dink: 0.6 * st.dink, smash: 0 }); // pass or lob them
+    else if (oppsBack) type = pickWeighted({ dink: 1.7 * st.dink, drive: 1 * st.drive, lob: 0.25 * st.lob, smash: 0 }); // drop it short
+    else type = pickWeighted({ drive: 2 * st.drive, dink: 0.8 * st.dink, lob: 0.45 * st.lob, smash: 0 });
 
-    if (type !== 'dink' && ball.z < 5 && oppsUp && Math.random() < 0.08) type = 'lob';
-
-    // Aim for the biggest gap between the opponents
-    let best = 10, bestGap = -1;
-    for (const cx of [2.5, 5, 7.5, 10, 12.5, 15, 17.5]) {
-      const g = Math.min(...opps.map(o => Math.abs(cx - o.x)));
-      if (g > bestGap) { bestGap = g; best = cx; }
+    // Where to: a sharp angle, straight at a net player, or the biggest gap
+    let tx: number;
+    const netOpp = opps.find(o => Math.abs(o.y - NET_Y) < 9);
+    if (type !== 'lob' && Math.random() < st.angle * sk.smart) {
+      const leftGap = Math.min(...opps.map(o => Math.abs(1.4 - o.x)));
+      const rightGap = Math.min(...opps.map(o => Math.abs(18.6 - o.x)));
+      tx = leftGap > rightGap ? rand(1, 2.2) : rand(17.8, 19);
+    } else if ((type === 'drive' || type === 'smash') && netOpp && Math.random() < st.body) {
+      tx = netOpp.x + rand(-0.6, 0.6); // body shot: jam them
+    } else {
+      let best = 10, bestGap = -1;
+      for (const cx of [2.5, 5, 7.5, 10, 12.5, 15, 17.5]) {
+        const g = Math.min(...opps.map(o => Math.abs(cx - o.x)));
+        if (g > bestGap) { bestGap = g; best = cx; }
+      }
+      tx = Math.random() < 0.4 + sk.smart * 0.5 ? best + rand(-1.5, 1.5) : rand(4, 16);
     }
-    const tx = Math.random() < 0.4 + sk.smart * 0.5 ? best + rand(-1.5, 1.5) : rand(4, 16);
+
+    // A charged bot fires its own Hyper on an attacking shot
+    if (bot.en.value >= 100 && bot.en.hyperT <= 0 && (type === 'smash' || type === 'drive' || ball.z > 3) && Math.random() < 0.7) {
+      activateHyper(bot);
+    }
 
     // Pressure makes mistakes: stretching for the ball or facing a fast shot
     const incoming = Math.hypot(ball.vx, ball.vy);
     const stretch = Math.hypot(ball.x - bot.x, ball.y - bot.y) / sk.reach;
-    let err = sk.error * (0.7 + 0.5 * stretch + incoming / 70);
+    const fight = comeback(bot.team) ? 0.85 : 1;
+    let err = sk.error * st.risk * fight * (0.7 + 0.5 * stretch + incoming / 70);
     let netty = false;
-    const mishitChance = 0.03 + (1 - sk.smart) * 0.2 + (incoming > 45 ? 0.06 : 0) + (stretch > 0.85 ? 0.05 : 0) + (ball.power ? 0.3 : 0);
+    const mishitChance = (0.03 + (1 - sk.smart) * 0.2 + (incoming > 45 ? 0.06 : 0) + (stretch > 0.85 ? 0.05 : 0)) * st.risk * fight
+      + (ball.power ? 0.3 : 0);
     if (Math.random() < mishitChance) {
       if (Math.random() < 0.45) netty = true; // dumped into the net
       else err *= 3;                          // sprayed wide or long
@@ -1466,7 +1794,9 @@ export function createGame() {
     }
 
     const tgt = chasing ? (b.plan as Plan) : homeFor(b);
-    moveToward(b, tgt.x, tgt.y, b.skill.speed, dt);
+    // a team on a run of points plays with extra pace ("on fire")
+    const heat = streak.team === b.team && streak.n >= 3 ? 1.08 : 1;
+    moveToward(b, tgt.x, tgt.y, b.skill.speed * b.style.speed * heat, dt);
     b.x = clamp(b.x, X_MIN, X_MAX);
     b.y = clampOwnY(b.team, b.y);
 
@@ -1485,6 +1815,7 @@ export function createGame() {
       for (let j = i + 1; j < roster.length; j++) {
         const a = roster[i], c = roster[j];
         if (a.team !== c.team) continue;
+        if (a.human && c.human) continue; // two people steer themselves
         const dx = c.x - a.x, dy = c.y - a.y;
         const d = Math.hypot(dx, dy);
         const min = 2.2;
@@ -1516,9 +1847,16 @@ export function createGame() {
 
     if (state === 'menu') { updateMenuDemo(); return; }
     if (state === 'over') return;
+    if (netRole === 'guest') { updateGuest(dt); return; }
+    if (netRole === 'host' && netHold) { // someone is away: everything waits
+      holdT += dt;
+      if (holdT >= 0.5) { holdT = 0; sendSnapshot(); } // keep the others informed
+      return;
+    }
 
     const old = roster.map(a => [a.x, a.y]);
     updatePlayer(dt);
+    if (netRole === 'host') for (const a of roster) if (a.net) updateRemote(a, dt);
     updateEnergy(dt);
     for (const a of roster) if (!a.human) updateBot(a, dt);
     if (state !== 'serve') separate();
@@ -1530,6 +1868,291 @@ export function createGame() {
       if (stateTimer <= 0) {
         if (gameWinner) endGame();
         else setupServe();
+      }
+    }
+    if (netRole === 'host' && (state as State) !== 'over') {
+      netClock += dt * 1000;
+      snapT += dt * 1000;
+      if (snapT >= SNAPSHOT_MS) { snapT = 0; sendSnapshot(); }
+    }
+  }
+
+  // =====================================================================
+  //  Online: host side
+  // =====================================================================
+  function sendSnapshot() {
+    if (!netSend) return;
+    const st = state === 'paused' ? (pausedFrom as State) : state;
+    if (st !== 'serve' && st !== 'rally' && st !== 'point' && st !== 'over') return;
+    const snap: Snapshot = {
+      k: 'snap', q: ++snapSeq, st,
+      sc: [score.player, score.ai], sv: toW(server), ss: serverAth.seat, sn: serverNum,
+      lh: lastHitter ? toW(lastHitter) : -1,
+      sh: shots, bn: bounces,
+      ct: seats.map(a => a.court),
+      p: seats.map(a => [r2(a.x), r2(a.y)] as [number, number]),
+      b: packBall(ball),
+      e: seats.map(a => [r2(a.en.value), r2(a.en.hyperT)] as [number, number]),
+      gw: gameWinner ? toW(gameWinner) : -1, rc: rallyLog.length,
+      hh: [r2(serveHalf[0]), r2(serveHalf[1])], ts: Math.round(netClock), sg: setupGen,
+      hw: netHold ? holdNames.slice(0, 60) : '',
+    };
+    netSend(snap);
+  }
+
+  const lastReply = new Map<string, number>();
+  const throttled = (key: string, now: number) => {
+    if (now - (lastReply.get(key) ?? 0) < 1000) return true;
+    lastReply.set(key, now);
+    return false;
+  };
+
+  // A message from the player in `seat` (each player sends on their own channel,
+  // so the seat is known for sure). Nothing they send is trusted beyond their input.
+  function hostReceive(raw: unknown, seat: number) {
+    const a = seatAth(seat);
+    if (!a || a === player || !a.net) return;
+    const m = parseGuestMsg(raw);
+    if (!m) return;
+    const now = Date.now();
+    a.net.last = now;
+    switch (m.k) {
+      case 'in':
+        a.net.x = m.x; a.net.y = m.y; a.net.aim = m.a; a.net.have = true;
+        a.net.gen = Math.min(m.s, setupGen);
+        break;
+      case 'shot':
+        if (state === 'serve' || state === 'rally') { a.net.aim = m.a; actionFor(a, m.ty); }
+        break;
+      case 'hyper':
+        activateHyper(a);
+        break;
+      case 'hello': // catch them up at once (at most once a second each)
+        if (!throttled(`hello${seat}`, now)) sendSnapshot();
+        break;
+      case 'need_log':
+        if (!throttled(`log${seat}`, now)) netSend?.({ k: 'ev', e: { k: 'log', l: rallyLog.slice() } });
+        break;
+    }
+  }
+
+  // =====================================================================
+  //  Online: guest side (draws the host's match, moves only you)
+  // =====================================================================
+  let lastSnap: Snapshot | null = null;
+
+  // guest: where you were over the last second (to compare with the host's delayed view)
+  const myTrail: { x: number; y: number; t: number }[] = [];
+  let driftT = 0;
+
+  function updateGuest(dt: number) {
+    const old = roster.map(a => [a.x, a.y]);
+    updatePlayer(dt);                            // your own movement is instant
+    const nowT = Date.now();
+    myTrail.push({ x: player.x, y: player.y, t: nowT });
+    while (myTrail.length && nowT - myTrail[0].t > 1000) myTrail.shift();
+    // everyone else glides to where the host last placed them
+    const k = 1 - Math.exp(-dt * 18);
+    for (const a of roster) {
+      if (a === player || !a.net) continue;
+      a.x += (a.net.x - a.x) * k;
+      a.y += (a.net.y - a.y) * k;
+    }
+    if (ball.held) holdBallFor(serverAth);
+    else stepBall(dt);                           // same physics as the host: smooth between hits
+    updateEnergy(dt);
+    roster.forEach((a, i) => animatePerson(a, old[i][0], old[i][1], dt));
+
+    // report where you are (host's frame)
+    inT += dt * 1000;
+    const now = Date.now();
+    const key = `${r2(player.x)},${r2(player.y)},${aimDir()},${seenGen}`;
+    if ((inT >= INPUT_MS && key !== lastInKey) || now - lastInSent >= KEEPALIVE_MS) {
+      inT = 0;
+      lastInKey = key;
+      lastInSent = now;
+      netSend?.({ k: 'in', x: r2(inX(player.x)), y: r2(inY(player.y)), a: wireAim(aimDir()), s: seenGen });
+    }
+  }
+
+  function setBallFromWire(b: BallW) {
+    const m = mirrored() ? mirrorBall(b) : b;
+    ball.x = m[0]; ball.y = m[1]; ball.z = m[2];
+    ball.vx = m[3]; ball.vy = m[4]; ball.vz = m[5]; ball.g = m[6];
+    ball.held = (m[7] & 1) !== 0;
+    ball.netted = (m[7] & 2) !== 0;
+    ball.power = (m[7] & 4) !== 0;
+  }
+
+  function guestReceive(raw: unknown) {
+    const m = parseHostMsg(raw);
+    if (!m) return;
+    lastRecv = Date.now();
+    if (m.k === 'snap') applySnapshot(m);
+    else applyEvent(m.e);
+  }
+
+  function applySnapshot(s: Snapshot) {
+    if (lastSnap && s.q <= lastSnap.q) return; // old or repeated
+    const prevState = state;
+    lastSnap = s;
+    if (state === 'over' || state === 'menu') return;
+    score.player = s.sc[myTeamW]; score.ai = s.sc[1 - myTeamW];
+    server = fromW(s.sv);
+    serverAth = seatAth(s.ss) ?? serverAth;
+    serverNum = s.sn === 2 ? 2 : 1;
+    lastHitter = s.lh === -1 ? null : fromW(s.lh);
+    shots = s.sh;
+    bounces = s.bn;
+    s.ct.forEach((c, i) => { const a = seatAth(i); if (a) a.court = c === 'L' ? 'L' : 'R'; });
+    serveHalf = mirrored() ? [COURT_W - s.hh[1], COURT_W - s.hh[0]] : [s.hh[0], s.hh[1]];
+    gameWinner = s.gw === -1 ? null : fromW(s.gw);
+    let mine: { x: number; y: number } | null = null;
+    s.p.forEach((p, i) => {
+      const a = seatAth(i);
+      if (!a || !Array.isArray(p)) return;
+      const x = inX(p[0]), y = inY(p[1]);
+      if (a === player) mine = { x, y };
+      else if (a.net) { a.net.x = x; a.net.y = y; }
+    });
+    s.e.forEach((e, i) => { const a = seatAth(i); if (a && Array.isArray(e)) { a.en.value = e[0]; a.en.hyperT = e[1]; } });
+
+    const me = mine as { x: number; y: number } | null;
+    if (s.sg !== seenGen) { // a new serve: the host placed everyone
+      seenGen = s.sg;
+      if (me) { player.x = me.x; player.y = me.y; }
+      for (const a of roster) if (a !== player && a.net) { a.x = a.net.x; a.y = a.net.y; }
+      player.mvx = player.mvy = 0;
+      player.swing = 0; player.queued = false;
+      myTrail.length = 0;
+      driftT = 0;
+    } else if (me) {
+      // The host's copy of you is always a round trip behind while you run, so compare it
+      // with where you WERE recently, not where you are now. Only if the host keeps you
+      // somewhere you never were (it refused a move) do we ease you over to it.
+      const behind = Math.min(Math.hypot(me.x - player.x, me.y - player.y),
+        ...myTrail.map(p => Math.hypot(me.x - p.x, me.y - p.y)));
+      driftT = behind > 2.5 ? driftT + SNAPSHOT_MS / 1000 : 0;
+      if (driftT > 0.5) {
+        if (behind > 12) { player.x = me.x; player.y = me.y; } // far off: jump
+        else { player.x += (me.x - player.x) * 0.3; player.y += (me.y - player.y) * 0.3; } // glide
+      }
+    }
+
+    const ballHeld = (s.b[7] & 1) !== 0;
+    if (ballHeld) {
+      ball.held = true; ball.vx = ball.vy = ball.vz = 0;
+    } else {
+      // our ball follows the host's trajectory; correct it if it drifted (a missed hit)
+      const w = mirrored() ? mirrorBall(s.b) : s.b;
+      if (ball.held || Math.hypot(w[0] - ball.x, w[1] - ball.y, w[2] - ball.z) > 2) setBallFromWire(s.b);
+    }
+
+    const st = s.st === 'over' ? 'point' : s.st; // 'over' arrives as its own event
+    if (st !== prevState) {
+      state = st;
+      if (st === 'serve') { landing = null; trail = []; }
+      syncState();
+    }
+    // missed a rally result: ask the host for the whole list
+    if (rallyLog.length < s.rc && Date.now() - needLogAt > 1500) {
+      needLogAt = Date.now();
+      netSend?.({ k: 'need_log' });
+    }
+  }
+
+  // The referee standing at the host's left is on team B's right.
+  const refFromWire = (r: number) => refs[mirrored() ? 1 - r : r] ?? refs[0];
+
+  function applyEvent(e: MatchEvent) {
+    if (state === 'menu') return;
+    switch (e.k) {
+      case 'hit': {
+        const team = fromW(e.t);
+        const h = seatAth(e.s) ?? teamOf(team)[0];
+        setBallFromWire(e.b);
+        lastHitter = team;
+        shots = e.n;
+        bounces = 0;
+        landing = predictLanding();
+        rallyPop = 1;
+        if (!(h.stroke && h.strokeT < 0.6)) startStroke(h, e.sk, 0.35);
+        splitStep(other(team));
+        if (h === player) { player.swing = 0; player.queued = false; startStroke(player, e.sk, 0.4); }
+        hitFx(h, e.ty, e.sm, e.hy, inX(e.p[0]), inY(e.p[1]), e.p[2]);
+        break;
+      }
+      case 'serve': {
+        const team = fromW(e.t);
+        setBallFromWire(e.b);
+        state = 'rally';
+        lastHitter = team;
+        shots = 1;
+        bounces = 0;
+        serveFx(seatAth(e.s) ?? serverAth);
+        syncState();
+        break;
+      }
+      case 'ref': {
+        refCall(refFromWire(e.r), e.p as RefPose, e.x, {
+          color: e.c, dur: e.d, whistle: e.w, speech: e.s, interrupt: e.i,
+          target: e.tg ? { x: inX(e.tg[0]), y: inY(e.tg[1]) } : undefined,
+        });
+        break;
+      }
+      case 'refx': {
+        const ref = refFromWire(0); // the head referee
+        if (ref.bubble) ref.bubble.text += ' ' + e.x;
+        say(e.x, ref.pitch);
+        break;
+      }
+      case 'float':
+        floatText(inX(e.x), inY(e.y), e.tx, e.c, e.s);
+        break;
+      case 'point': {
+        const w = fromW(e.w);
+        state = 'point';
+        if (e.gw !== -1) gameWinner = fromW(e.gw);
+        if (w === 'player') guestPointsWon++;
+        const entry: RallyW = { w: e.w === 0 ? 'h' : 'g', t: e.ts };
+        if (e.i === rallyLog.length) rallyLog.push(entry);
+        else if (e.i > rallyLog.length && Date.now() - needLogAt > 500) { needLogAt = Date.now(); netSend?.({ k: 'need_log' }); }
+        const reason = e.mb === -1 ? e.r : missedText(fromW(e.mb));
+        pointFx(w, reason, e.m);
+        syncState();
+        rallyListeners.forEach(fn => { try { fn(); } catch { /* never breaks the game */ } });
+        break;
+      }
+      case 'setup':
+        landing = null;
+        trail = [];
+        fade = 0.6;
+        ball.netted = false;
+        ball.power = false;
+        hideBanner();
+        break;
+      case 'hyper': {
+        const a = seatAth(e.s);
+        if (!a) break;
+        if (e.a === 'on') { a.en.hyperT = HYPER_SECONDS; hyperOnFx(a); }
+        else if (e.a === 'ready') hyperReadyFx(a);
+        else { a.en.hyperT = 0; a.en.value = 0; hyperOverFx(a); }
+        break;
+      }
+      case 'log': {
+        // keep what we saw ourselves; take only the rallies we missed
+        const l = Array.isArray(e.l) ? e.l : [];
+        const agrees = rallyLog.every((r, i) => l[i] && l[i].w === r.w);
+        if (agrees && l.length >= rallyLog.length) rallyLog = l.map(r => ({ w: r.w === 'g' ? 'g' : 'h', t: Number(r.t) || 0 }));
+        break;
+      }
+      case 'over': {
+        score.player = e.sc[myTeamW]; score.ai = e.sc[1 - myTeamW];
+        gameWinner = fromW(e.w);
+        longestRally = e.lr;
+        pointsWon = guestPointsWon;
+        endGame();
+        break;
       }
     }
   }
@@ -1698,8 +2321,12 @@ export function createGame() {
     sg.addColorStop(0, 'rgba(255,255,255,0.22)');
     sg.addColorStop(1, 'rgba(255,255,255,0)');
     fillPts([[L, B, 0], [R, B, 0], [R, B + 22, 0], [L, B + 22, 0]], sg);
-    // cushioned sport surface around the court
-    fillPts(groundQuad(-10, -10, COURT_W + 10, COURT_L + 10), '#2f6e57');
+    // cushioned tournament surround (out-of-bounds area) around the court
+    fillPts(groundQuad(-10, -10, COURT_W + 10, COURT_L + 10), '#2c7353');
+    const sg2 = ctx.createLinearGradient(0, proj(0, -10, 0).y, 0, proj(0, COURT_L + 10, 0).y);
+    sg2.addColorStop(0, 'rgba(255,255,255,0.08)');
+    sg2.addColorStop(1, 'rgba(0,0,0,0.12)');
+    fillPts(groundQuad(-10, -10, COURT_W + 10, COURT_L + 10), sg2);
     fillPts(groundQuad(-10, -10, COURT_W + 10, -9.75), 'rgba(255,255,255,0.35)');
   }
 
@@ -1756,38 +2383,65 @@ export function createGame() {
   }
 
   // ---------- court ----------
+  // Regulation lines: 2 inches wide, white, painted inside the court's measurements
+  // (the outer edge of each boundary line is the court's edge).
+  const LINE_W = 2 / 12;
   function courtLine(x0: number, y0: number, x1: number, y1: number) {
-    const w = 0.085;
-    if (x0 === x1) fillPts(groundQuad(x0 - w, y0, x0 + w, y1), '#f4f7fb');
-    else fillPts(groundQuad(x0, y0 - w, x1, y0 + w), '#f4f7fb');
+    const w = LINE_W / 2;
+    const q = x0 === x1 ? groundQuad(x0 - w, y0, x0 + w, y1) : groundQuad(x0, y0 - w, x1, y0 + w);
+    fillPts(q, '#f6f8fb');
   }
 
-  function drawCourtSurface() {
-    fillPts(groundQuad(0, 0, COURT_W, COURT_L), '#1f5c9e');
-    fillPts(groundQuad(0, TOP_KITCHEN, COURT_W, BOT_KITCHEN), '#2e78c2');
+  // Text painted flat on the court (like a stencilled logo)
+  function paintText(text: string, x: number, y: number, sizeFt: number, color: string, weight = 900) {
+    const p = proj(x, y, 0);
+    const far = proj(x, y - 1, 0);
+    const squash = clamp((p.y - far.y) / p.s, 0.2, 1); // foreshortening of the floor
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.scale(1, squash);
+    ctx.font = `${weight} ${Math.max(6, p.s * sizeFt)}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.fillText(text, 0, 0);
+    ctx.restore();
+  }
 
-    courtLine(0, 0, 0, COURT_L);
-    courtLine(COURT_W, 0, COURT_W, COURT_L);
-    courtLine(0, 0, COURT_W, 0);
-    courtLine(0, COURT_L, COURT_W, COURT_L);
+  // A tournament court: 20 x 44 ft, 7 ft non-volley zone ("kitchen") each side of the net,
+  // centre lines from the kitchen line to the baseline, blue playing surface, lighter
+  // kitchen, green surround (drawn in drawFloor).
+  function drawCourtSurface() {
+    fillPts(groundQuad(0, 0, COURT_W, COURT_L), '#2458a4');
+    fillPts(groundQuad(0, TOP_KITCHEN, COURT_W, BOT_KITCHEN), '#2f6fbe');
+    // lighting: the far end catches more of the overhead lights
+    const far = proj(10, 0, 0), near = proj(10, COURT_L, 0);
+    const lg = ctx.createLinearGradient(0, far.y, 0, near.y);
+    lg.addColorStop(0, 'rgba(255,255,255,0.10)');
+    lg.addColorStop(0.5, 'rgba(255,255,255,0.02)');
+    lg.addColorStop(1, 'rgba(0,0,0,0.10)');
+    fillPts(groundQuad(0, 0, COURT_W, COURT_L), lg);
+    // a faint border band just outside the lines, like the paint edge on real courts
+    for (const [x0, y0, x1, y1] of [[-0.35, -0.35, COURT_W + 0.35, 0], [-0.35, COURT_L, COURT_W + 0.35, COURT_L + 0.35],
+      [-0.35, 0, 0, COURT_L], [COURT_W, 0, COURT_W + 0.35, COURT_L]]) {
+      fillPts(groundQuad(x0, y0, x1, y1), 'rgba(10,30,60,0.35)');
+    }
+
+    // boundary lines (inside the court), kitchen lines, centre lines
+    const w = LINE_W / 2;
+    courtLine(w, 0, w, COURT_L);
+    courtLine(COURT_W - w, 0, COURT_W - w, COURT_L);
+    courtLine(0, w, COURT_W, w);
+    courtLine(0, COURT_L - w, COURT_W, COURT_L - w);
     courtLine(0, TOP_KITCHEN, COURT_W, TOP_KITCHEN);
     courtLine(0, BOT_KITCHEN, COURT_W, BOT_KITCHEN);
     courtLine(10, 0, 10, TOP_KITCHEN);
     courtLine(10, BOT_KITCHEN, 10, COURT_L);
 
-    // "KITCHEN" painted flat on the court
-    for (const ky of [TOP_KITCHEN + 3.5, BOT_KITCHEN - 3.5]) {
-      const p = proj(10, ky, 0);
-      ctx.save();
-      ctx.translate(p.x, p.y);
-      ctx.scale(1, 0.42);
-      ctx.font = `800 ${Math.max(7, p.s * 1.5)}px system-ui, sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = 'rgba(255,255,255,0.16)';
-      ctx.fillText('KITCHEN', 0, 0);
-      ctx.restore();
-    }
+    // stencils: KITCHEN in each non-volley zone, the event wordmark behind each baseline
+    for (const ky of [TOP_KITCHEN + 3.5, BOT_KITCHEN - 3.5]) paintText('KITCHEN', 10, ky, 1.4, 'rgba(255,255,255,0.18)', 800);
+    paintText('PICKLEBALL HYPER', 10, -4.2, 2.2, 'rgba(255,255,255,0.55)');
+    paintText('PICKLEBALL HYPER', 10, COURT_L + 4.2, 2.2, 'rgba(255,255,255,0.4)');
   }
 
   // Animated highlights drawn over the (cached) court each frame
@@ -1811,37 +2465,61 @@ export function createGame() {
     const s = L.s;
     const zToY = (z: number) => L.y - z * s;
 
-    // shadow on the ground (sun from behind the far stand)
-    fillPts(groundQuad(-1, NET_Y, COURT_W + 1, NET_Y + 1.1), 'rgba(0,0,0,0.16)');
-    // see-through mesh
-    ctx.fillStyle = 'rgba(15,20,28,0.32)';
-    ctx.fillRect(L.x, zToY(NET_H), Rr.x - L.x, NET_H * s);
-    ctx.strokeStyle = 'rgba(230,236,245,0.3)';
+    // Regulation net: 36 in at the posts (22 ft apart, 1 ft outside each sideline),
+    // sagging to 34 in at the centre where a white centre strap holds it down.
+    const POST_H = 3.0, CENTER_H = 34 / 12;
+    const topAt = netTopAt; // the same height the ball collides with
+
+    // shadow on the ground
+    fillPts(groundQuad(-1, NET_Y, COURT_W + 1, NET_Y + 1.1), 'rgba(0,0,0,0.18)');
+    // dark see-through mesh (tournament nets are black)
+    ctx.fillStyle = 'rgba(8,10,14,0.42)';
+    ctx.beginPath();
+    for (let i = 0; i <= 44; i++) {
+      const fx = -1 + i * 0.5;
+      const X = L.x + (fx + 1) * s, Y = zToY(topAt(fx) + wobAt(fx));
+      if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y);
+    }
+    ctx.lineTo(Rr.x, zToY(0.05)); ctx.lineTo(L.x, zToY(0.05)); ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(210,218,230,0.22)';
     ctx.lineWidth = Math.max(0.5, s * 0.03);
     ctx.beginPath();
     for (let fx = -1; fx <= COURT_W + 1; fx += 0.5) {
       const X = L.x + (fx + 1) * s;
-      ctx.moveTo(X, zToY(0.1)); ctx.lineTo(X, zToY(NET_H - 0.1 + wobAt(fx)));
+      ctx.moveTo(X, zToY(0.12)); ctx.lineTo(X, zToY(topAt(fx) - 0.1 + wobAt(fx)));
     }
-    for (let z = 0.3; z < NET_H; z += 0.4) { ctx.moveTo(L.x, zToY(z)); ctx.lineTo(Rr.x, zToY(z)); }
+    for (let z = 0.3; z < CENTER_H; z += 0.4) { ctx.moveTo(L.x, zToY(z)); ctx.lineTo(Rr.x, zToY(z)); }
     ctx.stroke();
-    // white top tape
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = Math.max(2, s * 0.2);
-    ctx.lineCap = 'butt';
-    ctx.beginPath();
-    for (let i = 0; i <= 44; i++) {
-      const fx = -1 + i * 0.5;
-      const X = L.x + (fx + 1) * s, Y = zToY(NET_H - 0.08 + wobAt(fx));
-      if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y);
+    // bottom band
+    ctx.strokeStyle = 'rgba(20,24,32,0.9)';
+    ctx.lineWidth = Math.max(1.5, s * 0.1);
+    ctx.beginPath(); ctx.moveTo(L.x, zToY(0.08)); ctx.lineTo(Rr.x, zToY(0.08)); ctx.stroke();
+    // centre strap (2 in wide, white)
+    const cX = L.x + (COURT_W / 2 + 1) * s;
+    ctx.fillStyle = '#f4f6f9';
+    ctx.fillRect(cX - s * 0.085, zToY(CENTER_H + wobAt(COURT_W / 2)), s * 0.17, (CENTER_H + wobAt(COURT_W / 2)) * s);
+    // white top tape (follows the sag), with a thin dark edge for depth
+    for (const [col, wdt, dz] of [['rgba(0,0,0,0.35)', 0.26, -0.03], ['#ffffff', 0.2, 0]] as const) {
+      ctx.strokeStyle = col;
+      ctx.lineWidth = Math.max(2, s * wdt);
+      ctx.lineCap = 'butt';
+      ctx.beginPath();
+      for (let i = 0; i <= 44; i++) {
+        const fx = -1 + i * 0.5;
+        const X = L.x + (fx + 1) * s, Y = zToY(topAt(fx) - 0.08 + dz + wobAt(fx));
+        if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y);
+      }
+      ctx.stroke();
     }
-    ctx.stroke();
-    // posts
+    // round black posts with silver caps
     for (const X of [L.x, Rr.x]) {
-      const pg = ctx.createLinearGradient(X - s * 0.15, 0, X + s * 0.15, 0);
-      pg.addColorStop(0, '#f1f3f6'); pg.addColorStop(1, '#9aa3ad');
+      const pg = ctx.createLinearGradient(X - s * 0.16, 0, X + s * 0.16, 0);
+      pg.addColorStop(0, '#3a414c'); pg.addColorStop(0.45, '#151a21'); pg.addColorStop(1, '#0b0e13');
       ctx.fillStyle = pg;
-      ctx.fillRect(X - s * 0.14, zToY(NET_H + 0.15), s * 0.28, (NET_H + 0.15) * s);
+      ctx.fillRect(X - s * 0.15, zToY(POST_H + 0.12), s * 0.3, (POST_H + 0.12) * s);
+      ctx.fillStyle = '#c9d0d8';
+      ctx.fillRect(X - s * 0.17, zToY(POST_H + 0.2), s * 0.34, s * 0.1);
     }
   }
 
@@ -2051,7 +2729,7 @@ export function createGame() {
     ctx.beginPath();
     ctx.ellipse(g.x + s * 0.25, g.y + s * 0.05, s * 0.95 * shK, s * 0.3 * shK, 0, 0, Math.PI * 2);
     ctx.fill();
-    if (p.human && energy.hyperT > 0) { // Hyper mode: electric ring under the player
+    if (p.human && p.en.hyperT > 0) { // Hyper mode: electric ring under the player
       const pulse = 0.5 + 0.5 * Math.sin(clock * 14);
       ctx.strokeStyle = `rgba(124,242,255,${0.6 + 0.35 * pulse})`;
       ctx.lineWidth = Math.max(2, s * 0.14);
@@ -2061,7 +2739,7 @@ export function createGame() {
       groundEllipsePath(p.x, p.y, 2.2, 2.2);
       ctx.fill();
     }
-    if (p.human && p.queued && p.swing > 0) { // a shot is ready and waiting for the ball
+    if (p === player && p.queued && p.swing > 0) { // a shot is ready and waiting for the ball
       const r = 1.95 + 0.25 * Math.sin(clock * 12);
       ctx.strokeStyle = 'rgba(215,242,59,0.9)';
       ctx.lineWidth = Math.max(2, s * 0.12);
@@ -2516,9 +3194,12 @@ export function createGame() {
   }
 
   // ---------- ball ----------
+  // Drawn size of the ball (ft). A real ball is ~0.12 ft across; it's drawn larger so it
+  // stays easy to follow on a phone (was 0.21, now ~20% bigger).
+  const BALL_R = 0.25;
   function drawBallShadow() {
     const g = proj(ball.x, ball.y, 0);
-    const r = Math.max(2.5, 0.2 * g.s);
+    const r = Math.max(3, BALL_R * 0.95 * g.s);
     const a = clamp(0.38 - ball.z * 0.025, 0.08, 0.38);
     ctx.fillStyle = `rgba(0,0,0,${a})`;
     ctx.beginPath(); ctx.ellipse(g.x, g.y, r * 1.25, r * 0.5, 0, 0, Math.PI * 2); ctx.fill();
@@ -2532,10 +3213,10 @@ export function createGame() {
       const tp = proj(t.x, t.y, t.z);
       const k = (i + 1) / trail.length;
       ctx.fillStyle = t.power ? `rgba(255,70,25,${k * 0.6})` : t.hot ? `rgba(255,140,50,${k * 0.45})` : `rgba(240,250,120,${k * 0.3})`;
-      ctx.beginPath(); ctx.arc(tp.x, tp.y, Math.max(1.2, (t.power ? 0.32 : 0.17) * tp.s * k) + 0.5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(tp.x, tp.y, Math.max(1.4, (t.power ? 0.38 : 0.2) * tp.s * k) + 0.5, 0, Math.PI * 2); ctx.fill();
     }
     const g = proj(ball.x, ball.y, ball.z);
-    const r = Math.max(3, 0.21 * g.s);
+    const r = Math.max(3.6, BALL_R * g.s);
     const sq = ball.squash;
     ctx.save();
     ctx.translate(g.x, g.y);
@@ -2673,114 +3354,117 @@ export function createGame() {
     ctx.closePath();
     return w;
   }
-  function triangle(cx: number, cy: number, size: number, dir: 1 | -1) {
-    ctx.beginPath();
-    ctx.moveTo(cx + dir * size * 0.5, cy);
-    ctx.lineTo(cx - dir * size * 0.5, cy - size * 0.55);
-    ctx.lineTo(cx - dir * size * 0.5, cy + size * 0.55);
-    ctx.closePath();
-    ctx.fill();
-  }
 
-  // Broadcast-style scoreboard across the top of the court (touch devices held sideways):
-  // [▌ your team | score ] [ call · serve ] [ score | opponents ▐]
-  // It fits between the energy bar (left) and the Menu buttons (right).
+  // Broadcast-style scoreboard (fits between the energy bar on the left and the Menu buttons
+  // on the right), styled like a tournament TV graphic:
+  //   ▌ HANA / PIA          ● 2 │ 7 │   <- team rows: colour bar, names, serve marker (+ server
+  //   ▌ REX / GIL               │ 4 │      number in doubles), score cell (lime = serving side)
+  //   DOUBLES · TO 11     GAME POINT   7–4–2   <- footer: format, game point, the official call
   function drawCompactScore() {
     if (!hudRightW) hudRightW = 130;
     const sc = clamp(VIEW_H / 400, 0.85, 1.4);
-    const top = 8, H = Math.round(44 * sc), rad = 10 * sc;
+    const top = 6;
+    const rowH = Math.round(20 * sc), footH = Math.round(13 * sc), gapRow = 1;
     const energyW = clamp(VIEW_W * 0.3, 120, 210);
     const side = Math.max(energyW + 26, hudRightW + 22);
-    const maxW = Math.max(230 * sc, VIEW_W - side * 2);
-    const boxW = Math.round(40 * sc), centerW = Math.round(70 * sc), padX = Math.round(10 * sc), strip = 4 * sc;
-    const nameF = Math.round(13 * sc), scoreF = Math.round(25 * sc), callF = Math.round(14 * sc), subF = Math.round(8.5 * sc);
+    const maxW = Math.max(210 * sc, VIEW_W - side * 2);
+    const doubles = mode === 'doubles';
+    const bar = Math.round(5 * sc), pad = Math.round(8 * sc), cellW = Math.round(34 * sc);
+    const serveW = Math.round((doubles ? 24 : 15) * sc);
+    const nameF = Math.round(11 * sc), scoreF = Math.round(16 * sc), footF = Math.round(8.5 * sc);
     ctx.save();
-    ctx.font = `800 ${nameF}px system-ui, sans-serif`;
-    const nameMax = Math.max(34, (maxW - centerW - boxW * 2 - padX * 4 - strip * 2) / 2);
+    ctx.font = `900 ${nameF}px system-ui, sans-serif`;
+    const nameMax = Math.max(44 * sc, maxW - bar - pad * 3 - serveW - cellW);
     const fit = (t: string) => {
       if (ctx.measureText(t).width <= nameMax) return t;
       let s = t;
       while (s.length > 1 && ctx.measureText(s + '…').width > nameMax) s = s.slice(0, -1);
       return s + '…';
     };
-    const compact = nameMax < 74; // too narrow for names: show YOU / OPP captions on the score boxes
-    const leftName = compact ? '' : fit(teamShort('player')), rightName = compact ? '' : fit(teamShort('ai'));
-    const lw = compact ? -padX : Math.max(ctx.measureText(leftName).width, ctx.measureText(rightName).width, 36 * sc); // same width both sides
-    const W = centerW + 2 * (strip + padX * 2 + lw + boxW);
+    const names: Record<Team, string> = { player: fit(boardName('player')), ai: fit(boardName('ai')) };
+    const nameW = Math.max(ctx.measureText(names.player).width, ctx.measureText(names.ai).width, 70 * sc);
+    const W = Math.round(bar + pad + nameW + pad + serveW + pad + cellW);
+    const H = rowH * 2 + gapRow + footH;
     const x0 = Math.round(VIEW_W / 2 - W / 2);
-    const midY = top + H / 2;
+    const rad = 7 * sc;
 
-    // panel with a soft drop shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.32)';
+    // panel: drop shadow, then clip everything to the rounded outline
+    ctx.fillStyle = 'rgba(0,0,0,0.38)';
     rr(x0 + 2, top + 3, W, H, rad); ctx.fill();
-    const bg = ctx.createLinearGradient(0, top, 0, top + H);
-    bg.addColorStop(0, '#1c2840'); bg.addColorStop(1, '#0d1420');
-    ctx.fillStyle = bg;
-    rr(x0, top, W, H, rad); ctx.fill();
-    // team colour strips at both ends
     ctx.save();
     rr(x0, top, W, H, rad); ctx.clip();
-    ctx.fillStyle = '#2f80ed'; ctx.fillRect(x0, top, strip, H);
-    ctx.fillStyle = '#e04848'; ctx.fillRect(x0 + W - strip, top, strip, H);
-    ctx.restore();
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 1;
-    rr(x0 + 0.5, top + 0.5, W - 1, H - 1, rad); ctx.stroke();
 
-    // names
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'left';
-    ctx.fillText(leftName, x0 + strip + padX, midY + 0.5);
-    ctx.textAlign = 'right';
-    ctx.fillText(rightName, x0 + W - strip - padX, midY + 0.5);
-
-    // score boxes (the serving side's box gets a lime outline)
-    const boxH = H - 10 * sc, boxY = top + 5 * sc;
-    const boxL = x0 + strip + padX * 2 + lw, boxR = boxL + boxW + centerW;
-    const drawBox = (bx: number, value: number, color: string, serving: boolean) => {
-      ctx.fillStyle = color;
-      rr(bx, boxY, boxW, boxH, 7 * sc); ctx.fill();
-      if (serving) { ctx.strokeStyle = '#d7f23b'; ctx.lineWidth = 2 * sc; rr(bx + 1, boxY + 1, boxW - 2, boxH - 2, 6 * sc); ctx.stroke(); }
-      ctx.fillStyle = '#ffffff';
-      ctx.font = `900 ${compact ? Math.round(scoreF * 0.88) : scoreF}px system-ui, sans-serif`;
+    const teams: Team[] = ['player', 'ai'];
+    teams.forEach((team, i) => {
+      const y = top + i * (rowH + gapRow);
+      const serving = server === team && (state === 'serve' || state === 'rally' || state === 'point');
+      const bg = ctx.createLinearGradient(0, y, 0, y + rowH);
+      bg.addColorStop(0, '#1b2740'); bg.addColorStop(1, '#111a2b');
+      ctx.fillStyle = bg;
+      ctx.fillRect(x0, y, W, rowH);
+      // team colour bar
+      ctx.fillStyle = team === 'player' ? '#2f80ed' : '#e04848';
+      ctx.fillRect(x0, y, bar, rowH);
+      // names
+      ctx.font = `900 ${nameF}px system-ui, sans-serif`;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      ctx.fillStyle = serving ? '#ffffff' : 'rgba(238,243,248,0.78)';
+      ctx.fillText(names[team], x0 + bar + pad, y + rowH / 2 + 0.5);
+      // serve marker: a little ball (+ the server number in doubles)
+      const sx = x0 + bar + pad + nameW + pad;
+      if (serving) {
+        const br = rowH * 0.2;
+        const bx = sx + br + 1, by = y + rowH / 2;
+        ctx.fillStyle = '#d7f23b';
+        ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = 'rgba(90,100,0,0.6)';
+        for (const [ox, oy] of [[-0.35, -0.2], [0.3, 0.25], [0.1, -0.45]]) {
+          ctx.beginPath(); ctx.arc(bx + ox * br, by + oy * br, br * 0.17, 0, Math.PI * 2); ctx.fill();
+        }
+        if (doubles) {
+          ctx.font = `900 ${Math.round(nameF * 0.95)}px system-ui, sans-serif`;
+          ctx.fillStyle = '#d7f23b';
+          ctx.textAlign = 'left';
+          ctx.fillText(String(serverNum), bx + br + 3 * sc, by + 0.5);
+        }
+      }
+      // score cell
+      const cx = x0 + W - cellW;
+      ctx.fillStyle = serving ? '#d7f23b' : '#26365a';
+      ctx.fillRect(cx, y, cellW, rowH);
+      ctx.fillStyle = serving ? '#0b111a' : '#ffffff';
+      ctx.font = `900 ${scoreF}px system-ui, sans-serif`;
       ctx.textAlign = 'center';
-      ctx.fillText(String(value), bx + boxW / 2, compact ? midY + 4 * sc : midY + 1);
-    };
-    drawBox(boxL, score.player, '#2f80ed', server === 'player');
-    drawBox(boxR, score.ai, '#d23c3c', server === 'ai');
-    if (compact) {
-      ctx.font = `900 ${subF}px system-ui, sans-serif`;
-      ctx.fillStyle = 'rgba(255,255,255,0.85)';
-      ctx.textAlign = 'center';
-      ctx.fillText('YOU', boxL + boxW / 2, boxY + subF * 0.9);
-      ctx.fillText('OPP', boxR + boxW / 2, boxY + subF * 0.9);
-    }
+      ctx.fillText(String(score[team]), cx + cellW / 2, y + rowH / 2 + 1);
+    });
+    // thin divider between the rows and before the score cells
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.fillRect(x0, top + rowH, W, gapRow);
 
-    // centre: the official call (server first) and who serves
-    let call = `${score[server]}–${score[other(server)]}`;
-    if (mode === 'doubles') call += `–${serverNum}`;
-    const cx = boxL + boxW + centerW / 2;
-    ctx.font = `900 ${callF}px system-ui, sans-serif`;
+    // footer strip
+    const fy = top + rowH * 2 + gapRow;
+    ctx.fillStyle = '#080d16';
+    ctx.fillRect(x0, fy, W, footH);
     ctx.fillStyle = '#d7f23b';
-    ctx.textAlign = 'center';
-    ctx.fillText(call, cx, midY - 6 * sc);
-    ctx.font = `800 ${subF}px system-ui, sans-serif`;
-    ctx.fillStyle = '#9fb0c3';
-    // "◀ SERVE" / "SERVE ▶"
-    const label = 'SERVE';
-    const tw = ctx.measureText(label).width;
-    const tri = subF * 0.85, gap = subF * 0.35;
-    const total = tw + gap + tri;
-    const ly = midY + 9 * sc;
-    if (server === 'player') {
-      triangle(cx - total / 2 + tri / 2, ly, tri, -1);
-      ctx.textAlign = 'left';
-      ctx.fillText(label, cx - total / 2 + tri + gap, ly);
-    } else {
-      ctx.textAlign = 'left';
-      ctx.fillText(label, cx - total / 2, ly);
-      triangle(cx + total / 2 - tri / 2, ly, tri, 1);
-    }
+    ctx.fillRect(x0, fy, W, Math.max(1, sc)); // accent line
+    const a = score[server], b = score[other(server)];
+    const gamePoint = state !== 'over' && a >= WIN_SCORE - 1 && a > b;
+    ctx.font = `800 ${footF}px system-ui, sans-serif`;
+    ctx.textBaseline = 'middle';
+    const fmid = fy + footH / 2 + 0.5;
+    ctx.textAlign = 'left';
+    const fmt = `${doubles ? 'DOUBLES' : 'SINGLES'}${netRole !== 'off' ? ' · ONLINE' : ''}`;
+    ctx.fillStyle = gamePoint ? '#ff5d5d' : '#9fb0c3'; // game point flagged in red
+    ctx.fillText(gamePoint ? 'GAME POINT' : `${fmt} · TO 11`, x0 + bar + pad, fmid);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#d7f23b';
+    ctx.font = `900 ${Math.round(footF * 1.05)}px system-ui, sans-serif`;
+    ctx.fillText(doubles ? `${a}–${b}–${serverNum}` : `${a}–${b}`, x0 + W - pad * 0.75, fmid);
+    ctx.restore();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)'; ctx.lineWidth = 1;
+    rr(x0 + 0.5, top + 0.5, W - 1, H - 1, rad); ctx.stroke();
     ctx.restore();
   }
 
@@ -3152,6 +3836,7 @@ export function createGame() {
   }
 
   function startGame() {
+    if (netRole !== 'off') return; // an online match is started by the lobby, not here
     ensureAudio();
     hush();
     freshGame = true;
@@ -3160,9 +3845,11 @@ export function createGame() {
     ai2.skill = AI;
     setMode(ui.selectedMode);
     assignBotNames(); // fresh opponents (and partner) every game
+    assignBotStyles(); // ...each with their own way of playing
     resetEnergy();
     score.player = 0;
     score.ai = 0;
+    streak.team = null; streak.n = 0;
     server = 'player';
     serverAth = player;
     serverNum = mode === 'doubles' ? 2 : 1; // doubles starts "0-0-2": one server only
@@ -3176,6 +3863,8 @@ export function createGame() {
     releaseAllTouches();
     setUi({ menuOpen: false, overOpen: false, pauseOpen: false, suspended: false }); // a new game replaces any paused match
     setupServe();
+    // introduce the opponents' styles above their heads
+    for (const b of teamOf('ai')) floatText(b.x, b.y, b.style.title, '#ffb347', 0.95);
   }
 
   function endGame() {
@@ -3185,7 +3874,9 @@ export function createGame() {
     const winner = gameWinner as Team;
     const winLine = `${teamLabel(winner)} ${teamVerb()}`;
     const diff = ui.difficulty;
-    const label = `${mode === 'doubles' ? 'Doubles' : 'Singles'} · ${diff[0].toUpperCase() + diff.slice(1)}`;
+    const label = netRole !== 'off'
+      ? `Online ${mode === 'doubles' ? '2 vs 2' : '1 vs 1'} · vs ${teamLabel('ai')}`
+      : `${mode === 'doubles' ? 'Doubles' : 'Singles'} · ${diff[0].toUpperCase() + diff.slice(1)}`;
     setUi({
       overOpen: true,
       state,
@@ -3199,11 +3890,29 @@ export function createGame() {
 
     const hi = Math.max(score.player, score.ai), lo = Math.min(score.player, score.ai);
     const wc = teamCenter(winner);
-    refCall(headRef, 'point', `Game! ${winLine} ${hi}–${lo}`, {
-      target: wc, dur: 3, whistle: true,
-      speech: `Game! ${winLine}, ${hi} to ${lo}.`,
-    });
-    refs[1].pose = 'point'; refs[1].poseT = 3; refs[1].target = wc;
+    if (netRole === 'host') netEmit({ k: 'over', w: toW(winner), sc: [score.player, score.ai], lr: longestRally });
+    if (!isGuest()) { // the guest gets the host's call
+      refCall(headRef, 'point', `Game! ${winLine} ${hi}–${lo}`, {
+        target: wc, dur: 3, whistle: true,
+        speech: `Game! ${winLine}, ${hi} to ${lo}.`,
+      });
+    }
+    const otherRef = mirrored() ? refs[0] : refs[1];
+    otherRef.pose = 'point'; otherRef.poseT = 3; otherRef.target = wc;
+
+    if (netRole !== 'off') {
+      const teamA = myTeamW === 0 ? score.player : score.ai;
+      const teamB = myTeamW === 0 ? score.ai : score.player;
+      const end: OnlineMatchEnd = {
+        hostScore: teamA,
+        guestScore: teamB,
+        longestRally,
+        rallies: rallyLog.slice(),
+      };
+      if (ui.online) setUi({ online: { ...ui.online, link: 'ended', menuOpen: false, note: 'Saving the result…' } });
+      onlineEndListeners.forEach(fn => { try { fn(end); } catch { /* never breaks the game */ } });
+      return; // online results go to the server, not to the CPU match history
+    }
 
     const result: MatchResult = {
       mode, difficulty: diff, playerScore: score.player, aiScore: score.ai, won,
@@ -3218,6 +3927,7 @@ export function createGame() {
   const mainMenuOverGame = () => ui.suspended && ui.menuOpen;
 
   function togglePause() {
+    if (netRole !== 'off') { toggleOnlineMenu(); return; } // online play can't stop
     if (mainMenuOverGame()) return; // the main menu is open over a paused match: use ‹ Back instead
     if (state === 'paused') {
       state = pausedFrom as State;
@@ -3255,6 +3965,11 @@ export function createGame() {
   // One "go back" used by every ‹ Back arrow and the Android back button.
   // Returns true when there was somewhere to go back to.
   function goBack(): boolean {
+    if (netRole !== 'off') { // online: Back opens / closes the match menu; after the match it leaves
+      if (state === 'over') requestLeaveOnline();
+      else toggleOnlineMenu();
+      return true;
+    }
     if (ui.customizeOpen) { if (customizeSaver) customizeSaver(); else closeCustomize(null); return true; } // Customize -> previous screen
     if (mainMenuOverGame()) { backToGameMenu(); return true; }          // Main menu -> in-game Menu
     if (state === 'paused') { togglePause(); return true; }             // in-game Menu -> game
@@ -3277,6 +3992,11 @@ export function createGame() {
   // "Menu" button: opens the in-game menu (Resume / Customize / Restart / Main menu)
   function menuButton() {
     ensureAudio();
+    if (netRole !== 'off') {
+      if (state === 'over') requestLeaveOnline();
+      else toggleOnlineMenu();
+      return;
+    }
     if (state === 'menu' || ui.customizeOpen || mainMenuOverGame()) return; // already on a menu screen
     if (state === 'over') { toMenu(); return; }
     togglePause();
@@ -3291,6 +4011,203 @@ export function createGame() {
     speech.on = on;
     if (!on) hush();
     setUi({ voiceOn: on });
+  }
+
+  // =====================================================================
+  //  Online match control (driven by src/backend/online/netplay.ts)
+  // =====================================================================
+  const leaveListeners = new Set<() => void>();
+
+  function toggleOnlineMenu() {
+    if (!ui.online || state === 'over') return;
+    releaseAllTouches();
+    setUi({ online: { ...ui.online, menuOpen: !ui.online.menuOpen } });
+  }
+
+  function requestLeaveOnline() {
+    leaveListeners.forEach(fn => { try { fn(); } catch { /* never breaks the game */ } });
+  }
+
+  function startOnline(o: OnlineStart) {
+    ensureAudio();
+    hush();
+    netRole = o.role;
+    netSend = o.send;
+    netHold = o.role === 'host'; // nothing moves until the others say hello
+    netClock = 0; snapT = 0; snapSeq = 0;
+    rallyLog = []; setupGen = 0; seenGen = -1;
+    streak.team = null; streak.n = 0;
+    for (const a of [player, mate, ai, ai2]) a.style = STEADY_STYLE;
+    lastSnap = null; guestPointsWon = 0; needLogAt = 0; inT = 0; lastInKey = ''; lastInSent = 0;
+    lastReply.clear();
+    lastRecv = 0;
+    const doubles = o.mode === 'doubles';
+    const seatCount = doubles ? 4 : 2;
+    mySeat = clamp(Math.round(o.seat), 0, seatCount - 1);
+    myTeamW = (mySeat % 2) as TeamW;
+    setMode(o.mode);
+
+    // Who stands where: you are always `player` (bottom). Your partner is `mate`;
+    // the other side are `ai` (lower seat) and `ai2`.
+    const oppSeats = [0, 1, 2, 3].slice(0, seatCount).filter(s => s % 2 !== myTeamW);
+    seats = [];
+    for (let s = 0; s < seatCount; s++) {
+      seats[s] = s === mySeat ? player : s % 2 === myTeamW ? mate : s === oppSeats[0] ? ai : ai2;
+    }
+    for (const a of [player, mate, ai, ai2]) { a.seat = -1; a.net = null; }
+    seats.forEach((a, s) => {
+      a.seat = s;
+      a.human = true;
+      a.lefty = false;
+      a.skill = DIFFICULTY.medium;
+      a.court = s < 2 ? 'R' : 'L'; // first two seats start in the right-hand courts
+      if (a !== player) a.net = { x: a.x, y: a.y, aim: 0, have: false, gen: -1, last: 0 };
+    });
+    for (const p of o.others) {
+      const a = seatAth(p.seat);
+      if (!a || a === player) continue;
+      a.name = (p.look.name || 'Player').slice(0, 16);
+      a.avatar = { ...p.look.avatar };
+      a.paddle = p.look.paddle;
+    }
+    // stand everyone in their own courts
+    for (const a of roster) {
+      const h = courtHalf(a.team, a.court);
+      a.x = (h[0] + h[1]) / 2;
+      a.y = behindBaseline(a.team);
+      if (a.net) { a.net.x = a.x; a.net.y = a.y; }
+    }
+
+    freshGame = true;
+    resetEnergy();
+    score.player = 0; score.ai = 0;
+    server = fromW(0); // the host's side serves first
+    serverAth = seats[0];
+    serverNum = doubles ? 2 : 1; // doubles starts "0-0-2"
+    gameWinner = null;
+    longestRally = 0;
+    pointsWon = 0;
+    particles = []; confetti = []; floaters = [];
+    ball.squash = 0;
+    for (const r of refs) { r.bubble = null; r.pose = 'idle'; }
+    releaseAllTouches();
+    const r = o.resume;
+    if (r && o.role === 'host') { // the host's app restarted: carry on from the last rally
+      score.player = r.score[0]; score.ai = r.score[1];
+      server = r.server === 0 ? 'player' : 'ai';
+      serverAth = seatAth(r.serverSeat) ?? seats[0];
+      serverNum = doubles && r.serverNum === 1 ? 1 : doubles ? 2 : 1;
+      r.courts.forEach((c, s) => { const a = seatAth(s); if (a) a.court = c === 'L' ? 'L' : 'R'; });
+      r.energy.forEach((v, s) => { const a = seatAth(s); if (a) a.en.value = clamp(v, 0, 99.9); });
+      rallyLog = r.rallies.slice();
+      netClock = r.clock;
+      longestRally = r.longestRally;
+      pointsWon = rallyLog.filter(x => x.w === 'h').length;
+      freshGame = false;
+    }
+    const names = o.others.filter(p => p.seat % 2 !== myTeamW).map(p => p.look.name).join(' & ') || 'your opponent';
+    setUi({
+      menuOpen: false, overOpen: false, pauseOpen: false, suspended: false, customizeOpen: false,
+      online: { role: o.role, opponent: names, link: 'waiting', menuOpen: false, note: 'Connecting…' },
+    });
+    if (o.role === 'host') {
+      setupServe();
+    } else {
+      state = 'serve'; // the first snapshot fills in the rest
+      ball.held = true;
+      hideBanner();
+      syncState();
+    }
+  }
+
+  /**
+   * A message from another player. On the host, `fromSeat` is the sender's seat
+   * (known from the channel it arrived on); guests only hear from the host.
+   */
+  function netReceive(m: unknown, fromSeat = -1) {
+    if (netRole === 'host') hostReceive(m, fromSeat);
+    else if (netRole === 'guest') guestReceive(m);
+  }
+
+  /** Host: when each other player was last heard from (Date.now(); 0 = never), by seat. */
+  function netLastBySeat(): { seat: number; last: number }[] {
+    return seats.filter(a => a !== player && a.net).map(a => ({ seat: a.seat, last: (a.net as NetAth).last }));
+  }
+
+  /** Host: hold the match while someone is away (and resume when they're back). */
+  function setNetHold(on: boolean, waitingFor = '') {
+    if (netRole !== 'host') return;
+    holdNames = on ? waitingFor : '';
+    if (netHold === on) return;
+    netHold = on;
+    if (on) releaseAllTouches();
+    else sendSnapshot();
+  }
+
+  /** Guest: who the host is waiting for (another guest who dropped out), or ''. */
+  const netWaitingFor = () => (isGuest() ? lastSnap?.hw ?? '' : '');
+
+  function setOnlineLink(link: OnlineUi['link'], note = '') {
+    if (!ui.online) return;
+    if (ui.online.link === link && ui.online.note === note) return;
+    setUi({ online: { ...ui.online, link, note } });
+  }
+
+  /** The server ended the match (forfeit, opponent left, …) or confirmed the result. */
+  function showOnlineResult(r: { title: string; score: string; stats: string; note: string; won: boolean | null }) {
+    if (netRole === 'off') return;
+    const wasOver = state === 'over';
+    state = 'over';
+    netHold = false;
+    hideBanner();
+    releaseAllTouches();
+    setUi({
+      state,
+      overOpen: true,
+      gameOver: wasOver ? ui.gameOver : { title: r.title, score: r.score, stats: r.stats },
+      online: ui.online ? { ...ui.online, link: 'ended', menuOpen: false, note: r.note } : null,
+    });
+    if (!wasOver && r.won) { sfx.win(); confettiBurst(160); }
+  }
+
+  /** Leaves the online match screen (the lobby / backend side is handled by netplay). */
+  function endOnline() {
+    netRole = 'off';
+    netSend = null;
+    netHold = false;
+    mySeat = 0;
+    myTeamW = 0;
+    seats = [];
+    // the computer players come back as they were
+    for (const [a, look] of [[mate, BOTS.mate], [ai, BOTS.cpu1], [ai2, BOTS.cpu2]] as const) {
+      a.human = false;
+      a.avatar = { ...look.avatar };
+      a.paddle = look.paddle;
+      a.skill = DIFFICULTY[ui.difficulty];
+    }
+    mate.skill = PARTNER_SKILL;
+    mate.lefty = true;
+    for (const a of [player, mate, ai, ai2]) { a.seat = -1; a.net = null; }
+    assignBotNames();
+    resetEnergy();
+    setUi({ online: null });
+    toMenu();
+  }
+
+  /** What the host needs to resume after an app restart (null when not hosting). */
+  function exportResume(): OnlineResume | null {
+    if (netRole !== 'host') return null;
+    return {
+      score: [score.player, score.ai],
+      server: server === 'player' ? 0 : 1,
+      serverSeat: serverAth.seat,
+      serverNum,
+      courts: seats.map(a => a.court),
+      energy: seats.map(a => a.en.value),
+      rallies: rallyLog.slice(),
+      clock: Math.round(netClock),
+      longestRally,
+    };
   }
 
   // =====================================================================
@@ -3444,10 +4361,41 @@ export function createGame() {
     debug: () => ({
       state, px: player.x, py: player.y, bx: ball.x, by: ball.y, bz: ball.z,
       energy: energy.value, hyperT: energy.hyperT, shots, bounces, lastHitter, buttons,
+      ox: ai.x, oy: ai.y, oppEnergy: ai.en.value, oppHyperT: ai.en.hyperT,
+      seat: mySeat, mode,
+      athletes: roster.map(a => ({ seat: a.seat, x: a.x, y: a.y, team: a.team, name: a.name, hyperT: a.en.hyperT })),
+      serverSeat: serverAth.seat, serverNum,
+      bots: roster.filter(a => !a.human).map(a => ({ team: a.team, style: a.style.title, energy: a.en.value, hyperT: a.en.hyperT })),
+      streak: { ...streak },
+      score: { player: score.player, ai: score.ai }, server, serverIsMe: serverAth === player,
+      held: ball.held, rallies: rallyLog.slice(), netHold, role: netRole, gameWinner,
+      bvx: ball.vx, bvy: ball.vy, bvz: ball.vz, queued: !!player.queued,
     }),
     // cloud
     setProfile: applyProfile,
     onMatchEnd(fn: (r: MatchResult) => void) { matchListeners.add(fn); return () => { matchListeners.delete(fn); }; },
+    // online
+    startOnline, netReceive, setNetHold, setOnlineLink, endOnline, exportResume, toggleOnlineMenu, showOnlineResult,
+    requestLeaveOnline,
+    netLastRecv: () => lastRecv,
+    netLastBySeat,
+    netWaitingFor,
+    netRole: () => netRole,
+    onOnlineEnd(fn: (r: OnlineMatchEnd) => void) { onlineEndListeners.add(fn); return () => { onlineEndListeners.delete(fn); }; },
+    onRally(fn: () => void) { rallyListeners.add(fn); return () => { rallyListeners.delete(fn); }; },
+    onLeaveRequest(fn: () => void) { leaveListeners.add(fn); return () => { leaveListeners.delete(fn); }; },
+    /** Advances the simulation without drawing (automated tests only). */
+    step(seconds: number) { for (let t = 0; t < seconds; t += STEP) update(STEP); },
+    /** Test autopilot: moves your player and taps shots (automated tests only). */
+    testInput(i: { dx?: number; dy?: number; tap?: ShotType; hyper?: boolean }) {
+      if (i.dx !== undefined || i.dy !== undefined) {
+        const dx = i.dx ?? 0, dy = i.dy ?? 0;
+        if (dx === 0 && dy === 0) releaseJoystick();
+        else { joy.active = true; joy.id = -99; joy.x = clamp(dx, -1, 1); joy.y = clamp(dy, -1, 1); }
+      }
+      if (i.tap) action(i.tap);
+      if (i.hyper) pressHyper();
+    },
   };
 }
 

@@ -1,114 +1,84 @@
 // First screen after loading: Sign In / Create Account, or Play Offline.
 // Players who are already signed in skip it (see App.tsx).
 import React, { useEffect, useRef } from 'react';
-import { Animated, StyleSheet, Text, View } from 'react-native';
-import Svg, { Circle, Path } from 'react-native-svg';
-import { Card, GradientTitle, Overlay, Tap } from './common';
+import { Animated, Easing, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Backdrop, Brand, GameButton, Icon, IconName, Panel, RichList, useUiScale } from './gameUi';
 import { C } from './theme';
 
-function OptionIcon({ kind }: { kind: 'account' | 'offline' }) {
-  return (
-    <Svg width={30} height={30} viewBox="0 0 24 24">
-      {kind === 'account' ? (
-        <>
-          <Circle cx={12} cy={8} r={4} fill="#111111" />
-          <Path d="M4 20c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5" fill="#111111" />
-        </>
-      ) : (
-        <Path d="M8 5.5v13l10.5-6.5z" fill="#ffffff" />
-      )}
-    </Svg>
-  );
-}
-
-function Option({ kind, title, text, perks, onPress, delay }: {
-  kind: 'account' | 'offline'; title: string; text: string; perks: string[]; onPress: () => void; delay: number;
-}) {
-  const a = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    Animated.spring(a, { toValue: 1, delay, friction: 7, tension: 80, useNativeDriver: true }).start();
-  }, [a, delay]);
-  const y = a.interpolate({ inputRange: [0, 1], outputRange: [18, 0] });
-  const account = kind === 'account';
-  return (
-    <Animated.View style={[s.optWrap, { opacity: a, transform: [{ translateY: y }] }]}>
-      <Tap onPress={onPress} scale={0.97} style={[s.opt, account ? s.optAccount : s.optOffline]}
-        accessibilityLabel={title}>
-        <View style={[s.sym, account ? s.symAccount : s.symOffline]}>
-          <OptionIcon kind={kind} />
-        </View>
-        <Text style={[s.optTitle, account && s.dark]}>{title}</Text>
-        <Text style={[s.optText, account && s.darkMuted]}>{text}</Text>
-        <View style={s.perks}>
-          {perks.map(p => (
-            <Text key={p} style={[s.perk, account && s.darkMuted]}>{account ? '✓' : '•'}  {p}</Text>
-          ))}
-        </View>
-      </Tap>
-    </Animated.View>
-  );
-}
+const FEATURES: [IconName, string][] = [
+  ['users', '1 vs 1 & 2 vs 2'],
+  ['globe', 'Online play'],
+  ['bolt', 'Hyper skill'],
+  ['trophy', 'Ranked ladder'],
+];
 
 export function StartScreen({ short, onAccount, onOffline }: { short: boolean; onAccount: () => void; onOffline: () => void }) {
+  void short; // sizing comes from the real screen size
+  const { z, landscape, tight } = useUiScale();
+  const enter = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(enter, { toValue: 1, duration: 560, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+  }, [enter]);
+  const leftIn = { opacity: enter, transform: [{ translateX: enter.interpolate({ inputRange: [0, 1], outputRange: [-40, 0] }) }] };
+  const rightIn = { opacity: enter, transform: [{ translateX: enter.interpolate({ inputRange: [0, 1], outputRange: [40, 0] }) }] };
+
+  const left = (
+    <Animated.View style={[landscape ? s.leftCol : null, { gap: z(tight ? 10 : 16) }, leftIn]}>
+      <Brand z={z} size={tight ? 32 : 40} line="SPORTS ARCADE" />
+      <Text style={[s.tagline, { fontSize: z(15), lineHeight: z(21) }]}>
+        Fast, arcade pickleball on a real tournament court. Play the computer, your friends, or anyone online.
+      </Text>
+      <View style={[s.chips, { gap: z(8) }]}>
+        {FEATURES.map(([icon, label]) => (
+          <View key={label} style={[s.chip, { gap: z(6), paddingHorizontal: z(10), paddingVertical: z(6), borderRadius: z(10) }]}>
+            <Icon name={icon} size={z(14)} color={C.accent} />
+            <Text style={[s.chipText, { fontSize: z(12) }]}>{label}</Text>
+          </View>
+        ))}
+      </View>
+    </Animated.View>
+  );
+
+  const right = (
+    <Animated.View style={[landscape ? s.rightCol : null, rightIn]}>
+      <Panel z={z} title="HOW DO YOU WANT TO PLAY?" style={{ padding: z(14), gap: z(12) }}>
+        <GameButton title="SIGN IN / CREATE ACCOUNT" icon="user" glow z={z} height={66}
+          sub="Save your player · play online · climb the ranking" onPress={onAccount} />
+        <GameButton title="PLAY OFFLINE" icon="play" color="blue" z={z} height={60}
+          sub="Jump straight in · no account needed" onPress={onOffline} />
+        <RichList z={z} size={12} items={[
+          '**With an account:** your look, match history and online rating are saved and follow you to any phone.',
+          '**Offline:** everything stays on this phone. You can sign in any time from the main menu.',
+        ]} />
+      </Panel>
+    </Animated.View>
+  );
+
   return (
-    <Overlay z={8}>
-      <Card style={[s.card, short && s.cardShort]}>
-        <View style={s.head}>
-          <GradientTitle text="Pickleball" size={short ? 28 : 34} />
-          <View style={s.hyperTag}><Text style={s.hyperText}>HYPER</Text></View>
+    <View style={[StyleSheet.absoluteFill, s.screen]}>
+      <Backdrop sweep={!tight} strength={1.08} />
+      <ScrollView contentContainerStyle={[s.scroll, { padding: z(18) }]} showsVerticalScrollIndicator={false} bounces={false}>
+        <View style={[landscape ? s.row : null, s.content, { gap: z(22), maxWidth: z(980) }]}>
+          {left}
+          {right}
         </View>
-        <Text style={s.tagline}>How do you want to play?</Text>
-        <View style={[s.options, short && s.optionsRow]}>
-          <Option
-            kind="account"
-            title="Sign In / Create Account"
-            text="Play with your PickleBall: Hyper account."
-            perks={['Profile saved online', 'Match history', 'Leaderboard']}
-            onPress={onAccount}
-            delay={80}
-          />
-          <Option
-            kind="offline"
-            title="Play Offline"
-            text="Jump straight in, no account needed."
-            perks={['Progress stays on this phone', 'Sign in any time later']}
-            onPress={onOffline}
-            delay={180}
-          />
-        </View>
-      </Card>
-    </Overlay>
+      </ScrollView>
+    </View>
   );
 }
 
 const s = StyleSheet.create({
-  card: { maxWidth: 400, paddingVertical: 18, paddingHorizontal: 16 },
-  cardShort: { maxWidth: 680, paddingVertical: 14 },
-  head: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
-  hyperTag: {
-    backgroundColor: C.accent, borderRadius: 6, paddingHorizontal: 7, paddingVertical: 2,
-    transform: [{ rotate: '-6deg' }],
+  screen: { zIndex: 8 },
+  scroll: { flexGrow: 1, alignItems: 'center', justifyContent: 'center' },
+  content: { width: '100%' },
+  row: { flexDirection: 'row', alignItems: 'center' },
+  leftCol: { flex: 1, minWidth: 0 },
+  rightCol: { flex: 1.05, minWidth: 0 },
+  tagline: { color: '#cfdcea', fontWeight: '600' },
+  chips: { flexDirection: 'row', flexWrap: 'wrap' },
+  chip: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: 'rgba(20,31,48,0.85)', borderWidth: 1, borderColor: 'rgba(215,242,59,0.3)',
   },
-  hyperText: { color: '#111', fontSize: 13, fontWeight: '900', letterSpacing: 1 },
-  tagline: { color: C.muted, fontSize: 15, fontWeight: '700', textAlign: 'center', marginTop: 4, marginBottom: 14 },
-  options: { gap: 12 },
-  optionsRow: { flexDirection: 'row' },
-  optWrap: { flex: 1 },
-  opt: { flex: 1, alignItems: 'center', borderRadius: 18, paddingVertical: 16, paddingHorizontal: 14 },
-  optAccount: {
-    backgroundColor: '#d7f23b', shadowColor: C.accent, shadowOpacity: 0.35, shadowRadius: 18, elevation: 8,
-  },
-  optOffline: {
-    backgroundColor: '#183152', borderWidth: 2, borderColor: 'rgba(58,160,255,0.7)',
-    shadowColor: '#000', shadowOpacity: 0.35, shadowRadius: 18, elevation: 6,
-  },
-  sym: { width: 52, height: 52, borderRadius: 26, alignItems: 'center', justifyContent: 'center', marginBottom: 8 },
-  symAccount: { backgroundColor: 'rgba(0,0,0,0.12)' },
-  symOffline: { backgroundColor: C.you },
-  optTitle: { color: C.text, fontSize: 18, fontWeight: '900', textAlign: 'center' },
-  optText: { color: '#cfdcea', fontSize: 13, textAlign: 'center', marginTop: 4, lineHeight: 18 },
-  dark: { color: '#111' },
-  darkMuted: { color: '#2b3410' },
-  perks: { marginTop: 10, alignSelf: 'stretch', gap: 3 },
-  perk: { color: '#cfdcea', fontSize: 12, fontWeight: '700', textAlign: 'center' },
+  chipText: { color: C.text, fontWeight: '800' },
 });

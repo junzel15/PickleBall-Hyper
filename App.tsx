@@ -19,6 +19,10 @@ import { CustomizeScreen } from './src/ui/CustomizeScreen';
 import { Loader } from './src/ui/Loader';
 import { AccountScreen, CloudScreen, HistoryScreen, LeaderboardScreen, useAccount } from './src/ui/CloudScreens';
 import { startCloud } from './src/backend/cloud';
+import { startOnlineSession } from './src/backend/online/session';
+import {
+  InviteToast, MatchFoundModal, OnlineGameOver, OnlineLinkBanner, OnlineMatchMenu, OnlineScreen, useOnline,
+} from './src/ui/OnlineScreens';
 import { WelcomeModal } from './src/ui/WelcomeModal';
 import { TutorialModal } from './src/ui/TutorialModal';
 import { StartScreen } from './src/ui/StartScreen';
@@ -32,7 +36,12 @@ function Root() {
   const short = isShort(height);
 
   const acc = useAccount();
+  const onl = useOnline();
   const [cloud, setCloud] = useState<CloudScreen | null>(null);
+  // the Online screens (hub, room lobby, Quick Match) opened from the main menu
+  const [onlineOpen, setOnlineOpen] = useState(false);
+  const onlineOpenRef = useRef(onlineOpen);
+  onlineOpenRef.current = onlineOpen;
   // email of a player who just registered: shows the welcome modal (name + age)
   const [welcome, setWelcome] = useState<string | null>(null);
   const welcomeRef = useRef(welcome);
@@ -60,14 +69,27 @@ function Root() {
   useEffect(() => {
     let stop: (() => void) | null = null;
     let cancelled = false;
+    let stopOnline: (() => void) | null = null;
     game.runLoader(loadProfile).then(() => {
-      if (!cancelled) stop = startCloud(game);
+      if (cancelled) return;
+      stop = startCloud(game);
+      stopOnline = startOnlineSession(game);
     });
     return () => {
       cancelled = true;
       stop?.();
+      stopOnline?.();
     };
   }, [game]);
+
+  // an active match from before the app closed: open the Online screen to offer a rejoin
+  useEffect(() => {
+    if (onl.rejoin && entry === 'menu') setOnlineOpen(true);
+  }, [onl.rejoin, entry]);
+  // accepting an invite from anywhere opens the room
+  useEffect(() => {
+    if (onl.room && entry === 'menu' && !onl.inMatch) setOnlineOpen(true);
+  }, [onl.room, onl.inMatch, entry]);
 
   // Android back button steps back through the screens; at the main menu it leaves the app
   useEffect(() => {
@@ -82,6 +104,11 @@ function Root() {
         return true;
       }
       if (entryRef.current === 'start' || entryRef.current === 'pending') return false; // leave the app
+      if (game.netRole() !== 'off') return game.goBack(); // online match: its own menu
+      if (onlineOpenRef.current) {
+        setOnlineOpen(false);
+        return true;
+      }
       if (cloudRef.current) {
         setCloud(null);
         return true;
@@ -106,8 +133,11 @@ function Root() {
 
   // Cloud screens are opened from the main menu only
   const inMenu = entry === 'menu';
-  const cloudOpen = inMenu && ui.menuOpen && !ui.customizeOpen ? cloud : null;
-  const overlayUp = ui.menuOpen || ui.pauseOpen || ui.overOpen || ui.customizeOpen || !!welcome || tutorial || !inMenu;
+  const inOnlineMatch = !!ui.online;
+  const cloudOpen = inMenu && ui.menuOpen && !ui.customizeOpen && !inOnlineMatch ? cloud : null;
+  const onlineScreen = inMenu && ui.menuOpen && !ui.customizeOpen && !inOnlineMatch && onlineOpen;
+  const overlayUp = ui.menuOpen || ui.pauseOpen || ui.overOpen || ui.customizeOpen || !!welcome || tutorial || !inMenu
+    || !!ui.online?.menuOpen;
 
   return (
     <View
@@ -130,10 +160,17 @@ function Root() {
             playerName={ui.profile.name}
           />
         )}
-        {inMenu && ui.menuOpen && !cloudOpen && (
+        {inMenu && ui.menuOpen && !cloudOpen && !onlineScreen && !inOnlineMatch && (
           <MainMenu game={game} ui={ui} short={short} signedIn={!!acc.userId} onOpenCloud={setCloud}
-            onOpenTutorial={() => setTutorial(true)} />
+            onOpenTutorial={() => setTutorial(true)} onOpenOnline={() => setOnlineOpen(true)}
+            onlineBadge={onl.rejoin ? 'Rejoin' : onl.invites.length ? `${onl.invites.length} invite${onl.invites.length === 1 ? '' : 's'}` : ''}
+            onlineCount={acc.userId ? onl.onlineIds.length : null} />
         )}
+        {onlineScreen && (
+          <OnlineScreen onBack={() => setOnlineOpen(false)} onSignIn={() => { setOnlineOpen(false); setCloud('account'); }} />
+        )}
+        {inMenu && ui.menuOpen && !inOnlineMatch && !onlineScreen && <InviteToast st={onl} />}
+        {inMenu && <MatchFoundModal st={onl} />}
         {cloudOpen === 'account' && (
           <AccountScreen
             onBack={() => setCloud(null)}
@@ -160,7 +197,10 @@ function Root() {
             }}
           />
         )}
-        {ui.overOpen && <GameOver game={game} ui={ui} />}
+        {ui.overOpen && !inOnlineMatch && <GameOver game={game} ui={ui} />}
+        {ui.overOpen && inOnlineMatch && <OnlineGameOver ui={ui} />}
+        {inOnlineMatch && <OnlineLinkBanner ui={ui} />}
+        {inOnlineMatch && <OnlineMatchMenu game={game} ui={ui} />}
         {ui.customizeOpen && <CustomizeScreen game={game} ui={ui} short={short} />}
         <HudMini game={game} ui={ui} overlayUp={overlayUp} />
       </View>

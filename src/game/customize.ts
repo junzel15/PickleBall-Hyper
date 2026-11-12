@@ -96,10 +96,18 @@ export const DEFAULT_AVATAR: Avatar = {
 //  Paddles — original designs (fictional brands)
 //  power / control are 1-10 and slightly change how shots play.
 // =====================================================================
+/** Surface finish: gloss (default), matte, raw (textured carbon grit), metal (brushed) or holo (iridescent). */
+export type PaddleFinish = 'gloss' | 'matte' | 'raw' | 'metal' | 'holo';
 export interface Paddle {
   id: string; brand: string; model: string; shape: 'standard' | 'elongated' | 'wide'; pattern: string;
   c1: string; c2: string; accent: string; edge: string; grip: string; power: number; control: number;
+  finish?: PaddleFinish;
+  /** Line-up the paddle belongs to: shown as a badge in Customize. */
+  series?: 'PRO SERIES' | 'SIGNATURE' | 'CLASSIC';
 }
+export const FINISH_NAMES: Record<PaddleFinish, string> = {
+  gloss: 'Gloss', matte: 'Matte', raw: 'Raw carbon grit', metal: 'Brushed metal', holo: 'Holographic',
+};
 export const PADDLES: Paddle[] = [
   { id: 'vantage-carbon', brand: 'VANTAGE', model: 'Carbon Pro 16', shape: 'elongated', pattern: 'carbon', c1: '#17191e', c2: '#2d3038', accent: '#e63946', edge: '#e63946', grip: '#1f1f22', power: 8, control: 7 },
   { id: 'tidal-wave', brand: 'TIDAL', model: 'Wave 14', shape: 'standard', pattern: 'wave', c1: '#0b3d5c', c2: '#1fa2b8', accent: '#e8f7ff', edge: '#0b2a40', grip: '#0b2a40', power: 6, control: 8 },
@@ -113,6 +121,21 @@ export const PADDLES: Paddle[] = [
   { id: 'midnight-stealth', brand: 'MIDNIGHT', model: 'Stealth Raw', shape: 'elongated', pattern: 'gradient', c1: '#0d0f14', c2: '#3a4150', accent: '#8892a6', edge: '#050505', grip: '#111111', power: 9, control: 6 },
   { id: 'coral-reef', brand: 'CORAL', model: 'Reef Lite', shape: 'standard', pattern: 'gradient', c1: '#ff7e79', c2: '#ffd1a6', accent: '#ffffff', edge: '#e05d57', grip: '#e05d57', power: 5, control: 9 },
   { id: 'orbit-pro', brand: 'ORBIT', model: 'Pro Ring', shape: 'wide', pattern: 'rings', c1: '#0f2b46', c2: '#16507f', accent: '#ff9f1c', edge: '#ff9f1c', grip: '#0f2b46', power: 7, control: 8 },
+  // ---- Pro line-up: tour-inspired constructions and finishes (original designs) ----
+  { id: 'hexa-honeycomb', brand: 'HEXA', model: 'Honeycomb T700', shape: 'elongated', pattern: 'hex', c1: '#101317', c2: '#1d232b', accent: '#d7f23b', edge: '#d7f23b', grip: '#0d0f12', power: 8, control: 8, finish: 'raw', series: 'PRO SERIES' },
+  { id: 'aramid-gold', brand: 'ARAMID', model: 'Kevlar Gold 16', shape: 'standard', pattern: 'kevlar', c1: '#b8862b', c2: '#e0b44c', accent: '#14161a', edge: '#14161a', grip: '#14161a', power: 9, control: 7, finish: 'raw', series: 'PRO SERIES' },
+  { id: 'stormcell-bolt', brand: 'STORMCELL', model: 'Bolt 14', shape: 'elongated', pattern: 'lightning', c1: '#0a1030', c2: '#24317a', accent: '#5fe1ff', edge: '#5fe1ff', grip: '#0a1030', power: 9, control: 6, finish: 'gloss', series: 'PRO SERIES' },
+  { id: 'circuit-grid', brand: 'CIRCUIT', model: 'Pulse Grid', shape: 'standard', pattern: 'circuit', c1: '#06221c', c2: '#0b3b31', accent: '#2ef2a8', edge: '#2ef2a8', grip: '#06221c', power: 7, control: 8, finish: 'matte', series: 'PRO SERIES' },
+  { id: 'chrome-apex', brand: 'CHROMA', model: 'Titan Chrome', shape: 'wide', pattern: 'brushed', c1: '#9aa4b1', c2: '#e8edf2', accent: '#ff3b5c', edge: '#2a2f36', grip: '#1a1d22', power: 8, control: 7, finish: 'metal', series: 'PRO SERIES' },
+  { id: 'prism-holo', brand: 'PRISM', model: 'Holo Flux', shape: 'standard', pattern: 'prism', c1: '#1b1f3a', c2: '#3c2a6e', accent: '#ffffff', edge: '#c9b6ff', grip: '#1b1f3a', power: 7, control: 8, finish: 'holo', series: 'SIGNATURE' },
+  { id: 'luxe-marble', brand: 'LUXE', model: 'Marble Elite', shape: 'standard', pattern: 'marble', c1: '#f4f2ee', c2: '#cfc9c0', accent: '#c9a24a', edge: '#c9a24a', grip: '#f4f2ee', power: 6, control: 9, finish: 'gloss', series: 'SIGNATURE' },
+  { id: 'cosmos-nebula', brand: 'COSMOS', model: 'Nebula 16', shape: 'elongated', pattern: 'galaxy', c1: '#070816', c2: '#3b1a6b', accent: '#ff6ad5', edge: '#120a2a', grip: '#120a2a', power: 8, control: 7, finish: 'gloss', series: 'SIGNATURE' },
+  { id: 'riot-splash', brand: 'RIOT', model: 'Paint Splash', shape: 'wide', pattern: 'splatter', c1: '#f6f6f2', c2: '#ff2e7e', accent: '#1fb5ff', edge: '#151515', grip: '#151515', power: 7, control: 7, finish: 'matte', series: 'SIGNATURE' },
+  { id: 'contour-topo', brand: 'CONTOUR', model: 'Topo Trail', shape: 'standard', pattern: 'topo', c1: '#1f3b2c', c2: '#2f5a42', accent: '#f2c14e', edge: '#f2c14e', grip: '#1f3b2c', power: 6, control: 9, finish: 'matte', series: 'SIGNATURE' },
+  { id: 'strata-chevron', brand: 'STRATA', model: 'Chevron 16', shape: 'elongated', pattern: 'chevron', c1: '#ffffff', c2: '#0e1726', accent: '#ff5a1f', edge: '#0e1726', grip: '#0e1726', power: 8, control: 7, finish: 'gloss', series: 'PRO SERIES' },
+  { id: 'gp-checker', brand: 'GRAND PRIX', model: 'Checkered Flag', shape: 'standard', pattern: 'checker', c1: '#111111', c2: '#f2f2f2', accent: '#e10600', edge: '#e10600', grip: '#111111', power: 8, control: 6, finish: 'gloss', series: 'CLASSIC' },
+  { id: 'retro-sunset', brand: 'RETRO', model: 'Sunset 80s', shape: 'wide', pattern: 'sunset', c1: '#2b0f4c', c2: '#ff4f7b', accent: '#ffd23f', edge: '#2b0f4c', grip: '#2b0f4c', power: 6, control: 8, finish: 'matte', series: 'CLASSIC' },
+  { id: 'pixel-arcade', brand: '8-BIT', model: 'Arcade Pixel', shape: 'standard', pattern: 'pixel', c1: '#13132b', c2: '#2a2a5c', accent: '#d7f23b', edge: '#d7f23b', grip: '#13132b', power: 7, control: 7, finish: 'matte', series: 'CLASSIC' },
 ];
 export const DEFAULT_PADDLE = 'tidal-wave';
 export const paddleById = (id: string): Paddle =>
@@ -305,6 +328,203 @@ function paintPattern(ctx: Ctx2D, p: Paddle, sh: { L: number; W: number }) {
       ctx.restore();
       break;
     }
+    case 'hex': { // honeycomb core showing through raw carbon
+      ctx.fillStyle = lin(p.c1, p.c2); ctx.fillRect(x0, y0, w, h);
+      const r = 0.055, dx = r * Math.sqrt(3), dy = r * 1.5;
+      ctx.lineWidth = 0.007;
+      for (let j = 0, y = y0; y < y1 + r; y += dy, j++) {
+        for (let x = x0 + (j % 2 ? dx / 2 : 0); x < x1 + r; x += dx) {
+          const glow = Math.max(0, 1 - Math.hypot(x - 0.12, y) / 0.55); // lit toward the sweet spot
+          ctx.strokeStyle = rgba(p.accent, 0.12 + glow * 0.55);
+          ctx.beginPath();
+          for (let k = 0; k < 6; k++) {
+            const a = Math.PI / 6 + (k * Math.PI) / 3;
+            if (k === 0) ctx.moveTo(x + Math.cos(a) * r, y + Math.sin(a) * r); else ctx.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
+          }
+          ctx.closePath(); ctx.stroke();
+        }
+      }
+      ctx.fillStyle = p.accent; ctx.fillRect(x0, y0 + h * 0.06, w, 0.012); ctx.fillRect(x0, y1 - h * 0.06, w, 0.012);
+      break;
+    }
+    case 'kevlar': { // aramid weave: alternating gold blocks
+      ctx.fillStyle = p.c1; ctx.fillRect(x0, y0, w, h);
+      const s = 0.06;
+      for (let i = 0, x = x0; x < x1; x += s, i++) {
+        for (let j = 0, y = y0; y < y1; y += s, j++) {
+          const g = ctx.createLinearGradient(x, y, x + s, y + s);
+          const on = (i + j) % 2 === 0;
+          g.addColorStop(0, on ? p.c2 : shade(p.c1, -0.12)); g.addColorStop(1, on ? shade(p.c2, -0.2) : p.c1);
+          ctx.fillStyle = g; ctx.fillRect(x, y, s * 0.96, s * 0.96);
+        }
+      }
+      ctx.fillStyle = p.accent; ctx.fillRect(x0, -0.04, w, 0.08);
+      ctx.fillStyle = p.c2; ctx.fillRect(x0, -0.012, w, 0.024);
+      break;
+    }
+    case 'lightning': {
+      ctx.fillStyle = lin(p.c1, p.c2); ctx.fillRect(x0, y0, w, h);
+      const bolt = (ox: number, s: number, a: number) => {
+        ctx.fillStyle = rgba(p.accent, a);
+        ctx.beginPath();
+        ctx.moveTo(ox - 0.34 * s, -0.36 * s); ctx.lineTo(ox + 0.02 * s, -0.08 * s); ctx.lineTo(ox - 0.06 * s, -0.04 * s);
+        ctx.lineTo(ox + 0.36 * s, 0.36 * s); ctx.lineTo(ox - 0.02 * s, 0.06 * s); ctx.lineTo(ox + 0.06 * s, 0.02 * s);
+        ctx.closePath(); ctx.fill();
+      };
+      bolt(0.06, 1.25, 0.18);
+      bolt(0.06, 1, 0.95);
+      ctx.strokeStyle = rgba(p.accent, 0.35); ctx.lineWidth = 0.008;
+      for (let i = 0; i < 9; i++) {
+        const sx = x0 + R() * w, sy = y0 + R() * h;
+        ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx + 0.04, sy + 0.05); ctx.lineTo(sx + 0.02, sy + 0.07); ctx.lineTo(sx + 0.07, sy + 0.12); ctx.stroke();
+      }
+      break;
+    }
+    case 'circuit': {
+      ctx.fillStyle = lin(p.c1, p.c2); ctx.fillRect(x0, y0, w, h);
+      ctx.lineWidth = 0.012; ctx.lineCap = 'round';
+      for (let i = 0; i < 16; i++) {
+        let x = x0 + R() * w, y = y0 + R() * h;
+        ctx.strokeStyle = rgba(p.accent, 0.35 + R() * 0.5);
+        ctx.beginPath(); ctx.moveTo(x, y);
+        for (let k = 0; k < 3; k++) {
+          if (k % 2 === 0) x += (R() - 0.5) * 0.4; else y += (R() - 0.5) * 0.3;
+          ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.fillStyle = p.accent; ctx.beginPath(); ctx.arc(x, y, 0.016, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.strokeStyle = rgba(p.accent, 0.8); ctx.lineWidth = 0.014;
+      ctx.strokeRect(0.02, -0.11, 0.2, 0.22);
+      break;
+    }
+    case 'brushed': { // brushed alloy with a racing stripe
+      ctx.fillStyle = lin(p.c1, p.c2); ctx.fillRect(x0, y0, w, h);
+      ctx.lineWidth = 0.004;
+      for (let y = y0; y < y1; y += 0.012) {
+        ctx.strokeStyle = R() < 0.5 ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.1)';
+        ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y + 0.004); ctx.stroke();
+      }
+      ctx.fillStyle = p.accent; ctx.fillRect(x0, -0.07, w, 0.05);
+      ctx.fillStyle = p.edge; ctx.fillRect(x0, 0.0, w, 0.018);
+      break;
+    }
+    case 'prism': { // facets that the holo finish lights up
+      ctx.fillStyle = lin(p.c1, p.c2); ctx.fillRect(x0, y0, w, h);
+      const hues = ['#ff5f9e', '#ffd166', '#5ef2c2', '#5fb8ff', '#b78cff'];
+      for (let i = 0; i < 14; i++) {
+        ctx.fillStyle = rgba(hues[i % hues.length], 0.18 + R() * 0.22);
+        const cx = x0 + R() * w, cy = y0 + R() * h, s = 0.12 + R() * 0.16;
+        ctx.beginPath(); ctx.moveTo(cx, cy - s); ctx.lineTo(cx + s * 0.8, cy + s * 0.3); ctx.lineTo(cx - s * 0.7, cy + s * 0.6); ctx.closePath(); ctx.fill();
+      }
+      break;
+    }
+    case 'marble': {
+      ctx.fillStyle = lin(p.c1, p.c2); ctx.fillRect(x0, y0, w, h);
+      for (let i = 0; i < 7; i++) {
+        ctx.strokeStyle = i < 2 ? rgba(p.accent, 0.75) : 'rgba(80,80,90,0.22)';
+        ctx.lineWidth = i < 2 ? 0.01 : 0.005 + R() * 0.008;
+        let x = x0, y = y0 + R() * h;
+        ctx.beginPath(); ctx.moveTo(x, y);
+        while (x < x1) { x += 0.05; y += (R() - 0.45) * 0.07; ctx.lineTo(x, y); }
+        ctx.stroke();
+      }
+      break;
+    }
+    case 'galaxy': {
+      const g = ctx.createRadialGradient(0.15, -0.05, 0.02, 0.15, -0.05, 0.75);
+      g.addColorStop(0, rgba(p.accent, 0.85)); g.addColorStop(0.3, p.c2); g.addColorStop(1, p.c1);
+      ctx.fillStyle = g; ctx.fillRect(x0, y0, w, h);
+      ctx.fillStyle = 'rgba(95,184,255,0.25)';
+      ctx.beginPath(); ctx.ellipse(-0.15, 0.12, 0.28, 0.1, -0.4, 0, Math.PI * 2); ctx.fill();
+      for (let i = 0; i < 60; i++) {
+        ctx.fillStyle = `rgba(255,255,255,${(0.35 + R() * 0.65).toFixed(2)})`;
+        ctx.beginPath(); ctx.arc(x0 + R() * w, y0 + R() * h, 0.003 + R() * 0.008, 0, Math.PI * 2); ctx.fill();
+      }
+      break;
+    }
+    case 'splatter': {
+      ctx.fillStyle = p.c1; ctx.fillRect(x0, y0, w, h);
+      const blot = (col: string) => {
+        const cx = x0 + R() * w, cy = y0 + R() * h, r = 0.04 + R() * 0.08;
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+        for (let k = 0; k < 6; k++) {
+          const a = R() * Math.PI * 2, d = r * (1.2 + R() * 1.4);
+          ctx.beginPath(); ctx.arc(cx + Math.cos(a) * d, cy + Math.sin(a) * d, r * (0.1 + R() * 0.2), 0, Math.PI * 2); ctx.fill();
+        }
+      };
+      for (let i = 0; i < 6; i++) blot(p.c2);
+      for (let i = 0; i < 5; i++) blot(p.accent);
+      for (let i = 0; i < 3; i++) blot('#151515');
+      break;
+    }
+    case 'topo': { // contour map lines
+      ctx.fillStyle = lin(p.c1, p.c2); ctx.fillRect(x0, y0, w, h);
+      for (let k = 1; k <= 9; k++) {
+        ctx.strokeStyle = rgba(p.accent, k % 3 === 0 ? 0.75 : 0.32);
+        ctx.lineWidth = k % 3 === 0 ? 0.01 : 0.006;
+        ctx.beginPath();
+        for (let t = 0; t <= Math.PI * 2 + 0.01; t += 0.12) {
+          const rr = k * 0.055 * (1 + 0.18 * Math.sin(t * 3 + k * 0.4) + 0.08 * Math.sin(t * 5));
+          const x = 0.1 + Math.cos(t) * rr * 1.25, y = -0.03 + Math.sin(t) * rr;
+          if (t === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.closePath(); ctx.stroke();
+      }
+      break;
+    }
+    case 'chevron': {
+      ctx.fillStyle = p.c1; ctx.fillRect(x0, y0, w, h);
+      for (let i = 0; i < 4; i++) {
+        const x = x0 + 0.08 + i * 0.2;
+        ctx.fillStyle = i === 3 ? p.accent : p.c2;
+        ctx.beginPath();
+        ctx.moveTo(x, y0); ctx.lineTo(x + 0.12, y0); ctx.lineTo(x + 0.12 + 0.3, 0); ctx.lineTo(x + 0.12, y1); ctx.lineTo(x, y1); ctx.lineTo(x + 0.3, 0);
+        ctx.closePath(); ctx.fill();
+      }
+      break;
+    }
+    case 'checker': {
+      const s = 0.1;
+      for (let i = 0, x = x0; x < x1; x += s, i++) {
+        for (let j = 0, y = y0; y < y1; y += s, j++) {
+          ctx.fillStyle = (i + j) % 2 ? p.c1 : p.c2; ctx.fillRect(x, y, s, s);
+        }
+      }
+      ctx.save(); ctx.rotate(-0.5);
+      ctx.fillStyle = p.accent; ctx.fillRect(-1, -0.06, 2, 0.12);
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(-1, -0.075, 2, 0.015); ctx.fillRect(-1, 0.06, 2, 0.015);
+      ctx.restore();
+      break;
+    }
+    case 'sunset': { // retro sun with cut-out bands
+      ctx.fillStyle = lin(p.c1, shade(p.c1, 0.15)); ctx.fillRect(x0, y0, w, h);
+      const g = ctx.createLinearGradient(-0.3, 0, 0.45, 0);
+      g.addColorStop(0, p.c2); g.addColorStop(1, p.accent);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0.05, 0, 0.34, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = p.c1;
+      for (let k = 0; k < 5; k++) ctx.fillRect(-0.3 + k * 0.075, y0, 0.014 + k * 0.006, h);
+      ctx.strokeStyle = rgba(p.c2, 0.6); ctx.lineWidth = 0.008;
+      for (let k = 1; k <= 3; k++) { ctx.beginPath(); ctx.moveTo(x0, y0 + k * 0.05); ctx.lineTo(x1, y0 + k * 0.05); ctx.stroke(); }
+      break;
+    }
+    case 'pixel': {
+      ctx.fillStyle = p.c1; ctx.fillRect(x0, y0, w, h);
+      const s = 0.06;
+      for (let i = 0, x = x0; x < x1; x += s, i++) {
+        for (let j = 0, y = y0; y < y1; y += s, j++) {
+          const v = R();
+          const near = 1 - Math.min(1, Math.hypot(x - 0.1, y) / 0.6);
+          if (v < 0.25 + near * 0.4) {
+            ctx.fillStyle = v < 0.12 ? p.accent : v < 0.3 ? '#ff4fd8' : p.c2;
+            ctx.fillRect(x + 0.004, y + 0.004, s - 0.008, s - 0.008);
+          }
+        }
+      }
+      break;
+    }
     case 'rings': {
       const g = ctx.createRadialGradient(0.1, 0, 0.02, 0.1, 0, 0.7);
       g.addColorStop(0, p.c2); g.addColorStop(1, p.c1);
@@ -324,13 +544,36 @@ function paintPattern(ctx: Ctx2D, p: Paddle, sh: { L: number; W: number }) {
     }
   }
 
-  // Surface sheen for a real, slightly glossy finish
+  paintFinish(ctx, p, x0, y0, x1, y1, R);
+}
+
+/** The surface on top of the graphic: gloss sheen, matte, gritty raw carbon, brushed metal or holo. */
+function paintFinish(ctx: Ctx2D, p: Paddle, x0: number, y0: number, x1: number, y1: number, R: () => number) {
+  const w = x1 - x0, h = y1 - y0;
+  const finish = p.finish ?? 'gloss';
+  if (finish === 'raw') { // fine grit for spin
+    for (let i = 0; i < 260; i++) {
+      ctx.fillStyle = R() < 0.5 ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.16)';
+      ctx.fillRect(x0 + R() * w, y0 + R() * h, 0.008, 0.008);
+    }
+  }
+  if (finish === 'holo') {
+    const hg = ctx.createLinearGradient(x0, y1, x1, y0);
+    ['#ff5f9e', '#ffd166', '#5ef2c2', '#5fb8ff', '#b78cff', '#ff5f9e'].forEach((c, i, a) => hg.addColorStop(i / (a.length - 1), rgba(c, 0.32)));
+    ctx.fillStyle = hg; ctx.fillRect(x0, y0, w, h);
+  }
+  const sheen = { gloss: 0.24, matte: 0.07, raw: 0.1, metal: 0.38, holo: 0.3 }[finish];
   const sg = ctx.createLinearGradient(x0, y0, x1, y1);
-  sg.addColorStop(0, 'rgba(255,255,255,0.22)');
-  sg.addColorStop(0.45, 'rgba(255,255,255,0)');
-  sg.addColorStop(1, 'rgba(0,0,0,0.18)');
+  sg.addColorStop(0, `rgba(255,255,255,${sheen})`);
+  sg.addColorStop(finish === 'metal' ? 0.3 : 0.45, 'rgba(255,255,255,0)');
+  if (finish === 'metal') { sg.addColorStop(0.55, 'rgba(255,255,255,0.18)'); sg.addColorStop(0.7, 'rgba(255,255,255,0)'); }
+  sg.addColorStop(1, `rgba(0,0,0,${finish === 'matte' ? 0.1 : 0.18})`);
   ctx.fillStyle = sg;
   ctx.fillRect(x0, y0, w, h);
+  if (finish === 'gloss' || finish === 'holo') { // a crisp highlight streak
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.beginPath(); ctx.moveTo(x0 + w * 0.15, y0); ctx.lineTo(x0 + w * 0.3, y0); ctx.lineTo(x0 + w * 0.1, y1); ctx.lineTo(x0 - w * 0.05, y1); ctx.closePath(); ctx.fill();
+  }
 }
 
 /** Draws a paddle at the current origin. scale = pixels per unit (face ~1 unit long). */
