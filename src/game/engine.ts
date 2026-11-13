@@ -19,7 +19,7 @@ import { rgba, shade } from './colors';
 import { ensureAudio, isMuted, setMuted, sfx } from './audio';
 import { hushSpeech, speak, speech, waitForVoices } from './speech';
 import {
-  Avatar, BOTS, cloneProfile, defaultProfile, drawHeadBillboard, HeadLook, Look,
+  Avatar, BOTS, cloneProfile, legacy2D, defaultProfile, drawHeadBillboard, HeadLook, Look,
   PADDLES, paddleById, paddleSprite, Profile, SHOES,
 } from './customize';
 import {
@@ -165,10 +165,48 @@ interface Athlete {
   mvx?: number; mvy?: number;
   loco?: number; runFrac?: number; latFrac?: number; dirX?: number; dirW?: number; gait?: number;
   vis?: Pose;
+  visV?: Pose; // pose velocities for the spring smoothing
+  cpt?: { x: number; y: number; z: number } | null; // where the paddle met the ball (world), for the swing to reach it
   en: Energy;          // Hyper meter
   style: BotStyle;     // CPU players: how they play this match
   seat: number;        // online seat (0 = host); -1 offline
   net: NetAth | null;  // online: another person's athlete
+}
+/** One player as the 3D layer sees it (court feet: x across, y along the court, z up). */
+export interface Athlete3D {
+  id: string; team: Team; lefty: boolean;
+  x: number; y: number; vx: number; vy: number; lift: number;
+  stroke: string | null; strokeT: number; prep: number; prepKind: string;
+  inRally: boolean; cheer: boolean;
+  avatar: Avatar; paddle: string;
+  serving: boolean;                                     // waiting to serve
+  serverMark: boolean;                                  // show the serving arrow over their head
+  contact: { x: number; y: number; z: number } | null;  // where the paddle meets the ball this stroke
+}
+/** A mark on the floor: a (soft) disc, a ring, a dashed ring or a rectangle (x..x1, y..y1). */
+export interface Decal3D {
+  k: 'disc' | 'ring' | 'dash' | 'quad';
+  x: number; y: number; rx: number; ry: number; x1?: number; y1?: number;
+  w?: number; rot?: number; soft?: boolean; c: string; a: number;
+}
+/** The indoor hall around the court (feet), for the 3D layer. */
+export interface Hall3D {
+  left: number; right: number; back: number; ceil: number; pad: number; near: number;
+  lights: { x: number; y: number }[]; dividers: number[]; benches: { x: number; y: number; facing: number }[];
+}
+export interface Ball3D { x: number; y: number; z: number; spin: number; squash: number; visible: boolean; holder: string | null }
+export interface Ref3D { x: number; y: number; face: number; pose: string; look: number; target: { x: number; y: number } | null }
+/** The game's pinhole camera (see proj()) plus the players, ball and umpires, for the 3D layer. */
+export interface Scene3D {
+  w: number; h: number;
+  cam: { x: number; y: number; h: number; f: number; cx: number; hor: number };
+  paused: boolean;
+  clock: number;
+  hall: Hall3D;
+  decals: Decal3D[];
+  ball: Ball3D;
+  refs: Ref3D[];
+  athletes: Athlete3D[];
 }
 interface Ball {
   x: number; y: number; z: number; vx: number; vy: number; vz: number;
@@ -286,6 +324,13 @@ export function createGame() {
   let ctx: Ctx2D = null as unknown as Ctx2D;
   const frameRecorder = Skia.PictureRecorder();
   let frameCtx: Ctx2D | null = null;
+  // 3D players: when on, the frame is split into a background picture (court, shadows)
+  // and a transparent foreground picture (ball, effects, HUD), with the 3D layer between.
+  let use3D = false;
+  const frontRecorder = Skia.PictureRecorder();
+  let frontCtx: Ctx2D | null = null;
+  let frontPic: SkPicture | null = null;
+  const view3D = { ox: 0, oy: 0 }; // screen offset (camera pan + shake) applied this frame
 
   // ---------- graphics quality (adjusted automatically to the device) ----------
   // 2 = high, 1 = medium, 0 = low. Lower levels skip a few costly effects.
@@ -877,6 +922,7 @@ export function createGame() {
   // While the player is in Hyper mode every shot is faster, more accurate and lands
   // in tougher spots, and opponents struggle to return it.
   function doHit(hitter: Athlete, type: ShotType, tx: number, err: number, netty = false) {
+    hitter.cpt = { x: ball.x, y: ball.y, z: ball.z }; // the ball is at the paddle now
     const hyper = hitter.en.hyperT > 0; // people, and CPU players on Medium / Hard
     const strokeKind = strokeKindFor(hitter, type); // decided from the ball as it arrives
     const toTop = hitter.team === 'player';
@@ -986,8 +1032,12 @@ export function createGame() {
     else tx = clamp(p.x, 3, COURT_W - 3);
     const dx = ball.x - p.x, dy = ball.y - p.y;
     const d = Math.hypot(dx, dy);
-    const reachUsed = clamp((d - 0.8) / (REACH - 0.8), 0, 1);
-    const err = 0.6 + 0.9 * reachUsed; // sloppier at full stretch
+    // Cleanest at a natural arm's-length contact beside the body; sloppier at full
+    // stretch, a little sloppier when the ball is jammed into the body or very low/high.
+    const offIdeal = Math.max(0, Math.abs(d - CONTACT_IDEAL) - 0.6);
+    const reachUsed = clamp(offIdeal / (REACH - CONTACT_IDEAL - 0.6), 0, 1);
+    const awkwardZ = clamp((0.9 - ball.z) / 0.9, 0, 1) * 0.25 + clamp((ball.z - 6.2) / 1.3, 0, 1) * 0.2;
+    const err = 0.5 + 0.85 * reachUsed + awkwardZ;
     // Step and reach toward the ball so the paddle meets it (like a real player lunging)
     const excess = d - CONTACT_IDEAL;
     if (excess > 0.05 && d > 0 && p === player) {
@@ -1002,25 +1052,31 @@ export function createGame() {
   }
 
   function humanServe(p: Athlete) {
-    if (!serveBox) return;
-    const aim = aimOf(p);
-    const cx = (serveBox.x0 + serveBox.x1) / 2;
-    const tx = cx + aim * 3.2 + randn() * 0.8;
-    const depth = rand(2.5, 6) + randn() * 0.8;
-    const ty = p.team === 'player' ? depth : COURT_L - depth;
-    launch(tx, ty, rand(1.05, 1.2));
-    beginRallyFromServe(p);
-    if (p === player) buzz(15);
+    if (!serveBox || serveWind) return;
+    const box = serveBox;
+    const aim = aimOf(p); // aimed when tapped
+    startServeWind(p, () => {
+      const cx = (box.x0 + box.x1) / 2;
+      const tx = cx + aim * 3.2 + randn() * 0.8;
+      const depth = rand(2.5, 6) + randn() * 0.8;
+      const ty = p.team === 'player' ? depth : COURT_L - depth;
+      launch(tx, ty, rand(1.05, 1.2));
+      beginRallyFromServe(p);
+      if (p === player) buzz(15);
+    });
   }
 
   function botServe(b: Athlete) {
+    if (serveWind) return;
     const box = serveBox as Box;
-    const e = b.skill.error * 0.35;
-    const tx = rand(box.x0 + 1.5, box.x1 - 1.5) + randn() * e;
-    const depth = rand(2.5, 6) + randn() * e;
-    const ty = b.team === 'ai' ? COURT_L - depth : depth;
-    launch(tx, ty, rand(1.05, 1.25));
-    beginRallyFromServe(b);
+    startServeWind(b, () => {
+      const e = b.skill.error * 0.35;
+      const tx = rand(box.x0 + 1.5, box.x1 - 1.5) + randn() * e;
+      const depth = rand(2.5, 6) + randn() * e;
+      const ty = b.team === 'ai' ? COURT_L - depth : depth;
+      launch(tx, ty, rand(1.05, 1.25));
+      beginRallyFromServe(b);
+    });
   }
 
   function beginRallyFromServe(who: Athlete) {
@@ -1035,7 +1091,9 @@ export function createGame() {
   }
 
   function serveFx(who: Athlete) {
-    startStroke(who, 'serve', 0.42);
+    // the wind-up already brought the paddle to the ball: just carry on into the follow-through
+    if (who.stroke === 'serve' && who.strokeT > 0.3) who.strokeRate = STROKE_RATE.serve;
+    else startStroke(who, 'serve', SERVE_CONTACT_T);
     splitStep(other(who.team));
     landing = predictLanding();
     sfx.hit();
@@ -1239,6 +1297,7 @@ export function createGame() {
   // =====================================================================
   function setupServe() {
     state = 'serve';
+    serveWind = null;
     shots = 0;
     bounces = 0;
     lastHitter = null;
@@ -1354,14 +1413,16 @@ export function createGame() {
     let prepTarget = 0;
     if (state === 'rally' && lastHitter && lastHitter !== p.team && !ball.netted && !p.stroke) {
       const d = Math.hypot(ball.x - p.x, ball.y - p.y);
-      prepTarget = clamp(1 - (d - 2.5) / 7, 0, 1);
+      // by time to arrival, so a fast ball still gets a full, smooth backswing
+      const tta = Math.abs(ball.vy) > 1 ? Math.max(0, (Math.abs(ball.y - p.y) - 1) / Math.abs(ball.vy)) : 9;
+      prepTarget = Math.max(clamp(1 - (tta - 0.15) / 0.5, 0, 1), clamp(1 - (d - 2.5) / 7, 0, 1));
       const side = sideFor(p);
       if (ball.z > 5 && d < 10 && shots >= 2) p.prepKind = 'smash';
       else if (ball.z < 2 && Math.abs(p.y - NET_Y) < 10) p.prepKind = 'dink_' + side;
       else if (bounces === 0 && shots >= 3 && ball.z > 2.6) p.prepKind = 'volley_' + side;
       else p.prepKind = 'drive_' + side;
     }
-    p.prep += (prepTarget - p.prep) * Math.min(1, dt * 7);
+    p.prep += (prepTarget - p.prep) * Math.min(1, dt * 9);
     updatePoseSmoothing(p, dt);
     if (sp > 7) {
       p.dustT -= dt;
@@ -1372,12 +1433,59 @@ export function createGame() {
     }
   }
 
-  // Server holds the ball out in front at waist height, on the paddle side
+  // ---------- the serve: a real underhand drop serve ----------
+  // Body coordinates [u, z, w]: u toward the paddle hand, z up, w toward the net (feet).
+  // Waiting: the free hand holds the ball out in front, beside the body (so it is
+  // visible from behind). On the tap the paddle swings back while the free hand
+  // carries the ball in front of the paddle-side hip and lets go; the ball drops and
+  // the paddle meets it below the waist, then follows through up toward the target.
+  const SERVE_HOLD = [-0.74, 3.2, 0.7];
+  const SERVE_RELEASE = [0.64, 3.35, 0.75];
+  const SERVE_CONTACT_Z = 2.2;                 // where the paddle face is at contact (see STROKES.serve)
+  const SERVE_CARRY = 0.16;                    // s to bring the ball across
+  const SERVE_FALL = Math.sqrt((2 * (SERVE_RELEASE[1] - SERVE_CONTACT_Z)) / G);
+  const SERVE_WIND = SERVE_CARRY + SERVE_FALL; // tap -> contact
+  const SERVE_CONTACT_T = 0.45;                // contact point within the serve stroke
+  let serveWind: { who: Athlete; t: number; go: (() => void) | null } | null = null;
+
+  /** Where the server's ball is (body coordinates), t seconds into the wind-up (-1: waiting). */
+  function serveBallBody(t: number): number[] {
+    if (t < 0) return [SERVE_HOLD[0], SERVE_HOLD[1] + Math.abs(Math.sin(clock * 2.2)) * 0.1, SERVE_HOLD[2]];
+    if (t < SERVE_CARRY) {
+      const k = ease(t / SERVE_CARRY);
+      return [lerp(SERVE_HOLD[0], SERVE_RELEASE[0], k), lerp(SERVE_HOLD[1], SERVE_RELEASE[1], k) + Math.sin(Math.PI * k) * 0.12, lerp(SERVE_HOLD[2], SERVE_RELEASE[2], k)];
+    }
+    const f = Math.min(t, SERVE_WIND) - SERVE_CARRY;
+    return [SERVE_RELEASE[0], SERVE_RELEASE[1] - 0.5 * G * f * f, SERVE_RELEASE[2]];
+  }
+
+  // Server holds the ball (or drops it, during the wind-up)
   function holdBallFor(a: Athlete) {
     const towardNet = a.team === 'ai' ? 1 : -1;
-    ball.x = a.x + domSign(a) * 0.4;
-    ball.y = a.y + towardNet * 0.7;
-    ball.z = 3.0 + Math.abs(Math.sin(clock * 2.2)) * 0.12;
+    const [u, z, w] = serveBallBody(serveWind && serveWind.who === a ? serveWind.t : -1);
+    ball.x = a.x + domSign(a) * u;
+    ball.y = a.y + towardNet * w;
+    ball.z = z;
+  }
+
+  /** Start the serve motion; `go` launches the ball at contact (null on a guest: the host decides). */
+  function startServeWind(p: Athlete, go: (() => void) | null) {
+    if (serveWind) return;
+    serveWind = { who: p, t: 0, go };
+    startStroke(p, 'serve', 0);
+    p.strokeRate = SERVE_CONTACT_T / SERVE_WIND; // the paddle reaches the ball as it drops into place
+    if (go) netEmit({ k: 'wind', s: p.seat });
+  }
+  function tickServeWind(dt: number) {
+    if (!serveWind) return;
+    if (state !== 'serve') { serveWind = null; return; }
+    serveWind.t += dt;
+    const w = serveWind;
+    holdBallFor(w.who);
+    if (w.t >= SERVE_WIND) {
+      if (w.go) { serveWind = null; w.go(); }
+      else if (w.t > SERVE_WIND + 1) serveWind = null; // guest: the host's serve never came
+    }
   }
 
   // ---------- strokes, handedness and footwork cues ----------
@@ -1386,7 +1494,9 @@ export function createGame() {
   function domSign(p: Athlete) { return (p.team === 'player' ? 1 : -1) * (p.lefty ? -1 : 1); }
   function sideFor(p: Athlete) { return domSign(p) * (ball.x - p.x) >= -0.3 ? 'fh' : 'bh'; }
   function strokeKindFor(p: Athlete, type: ShotType) {
-    if (type === 'smash' || (type === 'drive' && ball.z > 4.8)) return 'smash';
+    // an overhead only for a ball that is actually high; a "smash" at a low ball is a hard drive swing
+    const near = Math.hypot(ball.x - p.x, ball.y - p.y) < REACH + 1;
+    if ((type === 'smash' && (ball.z > 3.8 || !near)) || (type === 'drive' && ball.z > 4.8)) return 'smash';
     const side = sideFor(p);
     if (type === 'dink') return 'dink_' + side;
     if (type === 'lob') return 'lob_' + side;
@@ -1395,11 +1505,14 @@ export function createGame() {
   }
   const STROKE_RATE: Record<string, number> = { drive: 3.0, volley: 4.2, dink: 2.4, lob: 2.6, smash: 3.4, serve: 2.3 };
   function startStroke(p: Athlete, kind: string, fromT: number) {
+    if (fromT === 0) p.cpt = null; // a swing from the start (serve, practice): no ball to reach yet
     p.stroke = kind;
     p.strokeT = fromT;
     p.strokeRate = STROKE_RATE[kind.split('_')[0]] || 3;
     p.tip = [];
     p.prep = 0;
+    // a swing that starts at contact (a hit): the paddle is already on its way to the ball
+    if (fromT >= 0.3 && p.vis) blendPose(p.vis, p.vis, poseFor(p), 0.6);
   }
   // Players hop into a balanced split step as the other side strikes the ball
   function splitStep(team: Team) {
@@ -1533,7 +1646,7 @@ export function createGame() {
 
     if (state === 'serve' && serverAth === player) {
       player.y = behindBaseline('player');
-      player.x = clamp(player.x + player.mvx * 0.6 * dt, serveHalf[0] + 0.5, serveHalf[1] - 0.5);
+      if (!serveWind) player.x = clamp(player.x + player.mvx * 0.6 * dt, serveHalf[0] + 0.5, serveHalf[1] - 0.5); // planted while serving
       holdBallFor(player);
       return;
     }
@@ -1583,12 +1696,22 @@ export function createGame() {
 
     // Best moment: when the ball is as close to the paddle as it will get. Hold on while it
     // is still coming closer, unless it's about to bounce a second time or time runs out.
+    // Timed against the contact spot a little in front of the body (where real players
+    // meet the ball), not the body's centre, so the ball is never hit once it's behind you.
+    const tn = p.team === 'player' ? -1 : 1; // toward the net
+    const cy = p.y + tn * 0.8;
     const look = 0.05;
-    const dNext = Math.hypot(ball.x + ball.vx * look - p.x, ball.y + ball.vy * look - p.y);
-    const closing = dNext < d - 0.03;
+    const nx = ball.x + ball.vx * look, ny = ball.y + ball.vy * look;
+    const dc = Math.hypot(ball.x - p.x, ball.y - cy);
+    const dcNext = Math.hypot(nx - p.x, ny - cy);
+    const closing = dcNext < dc - 0.03;
+    const inFrontNext = (ny - p.y) * tn > 0.25;
     const secondBounceSoon = bounces >= 1 && ball.z < 0.45 && ball.vz < 0;
-    const lastChance = p.swing < 0.06;
-    if (closing && d > CONTACT_IDEAL && !secondBounceSoon && !lastChance) return;
+    const lastChance = p.swing < 0.06 || Math.hypot(nx - p.x, ny - p.y) > REACH; // about to get away
+    if (closing && dc > CONTACT_IDEAL && inFrontNext && !secondBounceSoon && !lastChance) return;
+    // After the bounce, let the ball come up to a playable height instead of scooping it
+    // off the floor - while it is still in front of you and within reach.
+    if (bounces >= 1 && ball.vz > 0 && !lastChance && inFrontNext && ball.z < (p.swingType === 'dink' ? 0.9 : 1.6)) return;
 
     p.swing = 0;
     p.queued = false;
@@ -1607,7 +1730,7 @@ export function createGame() {
     const current = n.have && n.gen === setupGen; // ignore reports from before this serve's setup
     if (state === 'serve' && serverAth === a) {
       a.y = behindBaseline(a.team);
-      if (current) a.x = clamp(n.x, serveHalf[0] + 0.5, serveHalf[1] - 0.5);
+      if (current && !serveWind) a.x = clamp(n.x, serveHalf[0] + 0.5, serveHalf[1] - 0.5);
       holdBallFor(a);
       return;
     }
@@ -1859,6 +1982,7 @@ export function createGame() {
     if (netRole === 'host') for (const a of roster) if (a.net) updateRemote(a, dt);
     updateEnergy(dt);
     for (const a of roster) if (!a.human) updateBot(a, dt);
+    tickServeWind(dt);
     if (state !== 'serve') separate();
     stepBall(dt);
     roster.forEach((a, i) => animatePerson(a, old[i][0], old[i][1], dt));
@@ -1958,6 +2082,7 @@ export function createGame() {
       a.x += (a.net.x - a.x) * k;
       a.y += (a.net.y - a.y) * k;
     }
+    tickServeWind(dt);
     if (ball.held) holdBallFor(serverAth);
     else stepBall(dt);                           // same physics as the host: smooth between hits
     updateEnergy(dt);
@@ -2076,6 +2201,7 @@ export function createGame() {
         bounces = 0;
         landing = predictLanding();
         rallyPop = 1;
+        h.cpt = { x: ball.x, y: ball.y, z: ball.z };
         if (!(h.stroke && h.strokeT < 0.6)) startStroke(h, e.sk, 0.35);
         splitStep(other(team));
         if (h === player) { player.swing = 0; player.queued = false; startStroke(player, e.sk, 0.4); }
@@ -2084,6 +2210,7 @@ export function createGame() {
       }
       case 'serve': {
         const team = fromW(e.t);
+        serveWind = null;
         setBallFromWire(e.b);
         state = 'rally';
         lastHitter = team;
@@ -2123,7 +2250,13 @@ export function createGame() {
         rallyListeners.forEach(fn => { try { fn(); } catch { /* never breaks the game */ } });
         break;
       }
+      case 'wind': { // the server started the serve motion
+        const a = seatAth(e.s);
+        if (a && state === 'serve' && a === serverAth) startServeWind(a, null);
+        break;
+      }
       case 'setup':
+        serveWind = null;
         landing = null;
         trail = [];
         fade = 0.6;
@@ -2231,6 +2364,10 @@ export function createGame() {
   const LIGHTS: { x: number; y: number }[] = [];        // LED panels in the ceiling
   for (const y of [-10, 2, 14, 26, 38]) for (const x of [-14, 1, 19, 34]) LIGHTS.push({ x, y });
   const DIVIDER_X = [-12, COURT_W + 12];                 // mesh curtains separating the court
+  const BENCHES = [                                      // player benches along the sidelines
+    { x: DIVIDER_X[0] + 2.2, y: 13, facing: 1 }, { x: DIVIDER_X[0] + 2.2, y: 33, facing: 1 },
+    { x: DIVIDER_X[1] - 2.2, y: 13, facing: -1 }, { x: DIVIDER_X[1] - 2.2, y: 33, facing: -1 },
+  ];
 
   function line3(a: P3, b: P3, color: string, width: number) {
     const p = proj(a[0], a[1], a[2]), q = proj(b[0], b[1], b[2]);
@@ -2472,6 +2609,7 @@ export function createGame() {
 
     // shadow on the ground
     fillPts(groundQuad(-1, NET_Y, COURT_W + 1, NET_Y + 1.1), 'rgba(0,0,0,0.18)');
+    if (use3D) return; // the net itself is drawn by the 3D layer, in depth with the players
     // dark see-through mesh (tournament nets are black)
     ctx.fillStyle = 'rgba(8,10,14,0.42)';
     ctx.beginPath();
@@ -2558,7 +2696,9 @@ export function createGame() {
     volley_fh: [[0, 0.72, 4.15, 0.12, 50], [0.3, 0.8, 4.2, 0.02, 54], [0.45, 0.62, 4.15, 0.75, 34], [1, 0.52, 4.02, 0.85, 26]],
     lob_fh: [[0, 0.95, 2.45, -0.5, 140], [0.25, 1.0, 2.28, -0.45, 146], [0.45, 0.65, 2.62, 0.5, 120], [1, 0.25, 5.6, 0.4, 12]],
     smash: [[0, 0.5, 5.9, -0.6, 195], [0.25, 0.48, 6.05, -0.72, 200], [0.4, 0.5, 6.6, 0.3, 8], [0.6, 0.35, 5.4, 0.8, -40], [1, -0.45, 3.4, 0.5, -120]],
-    serve: [[0, 0.9, 2.42, -0.7, 172], [0.3, 0.95, 2.3, -0.78, 175], [0.48, 0.55, 2.6, 0.55, 155], [0.7, 0.35, 3.6, 0.8, 80], [1, 0.05, 4.85, 0.45, 15]],
+    // underhand pendulum: paddle back and low, face meets the dropped ball below the waist in
+    // front of the paddle-side hip (t = SERVE_CONTACT_T), then low-to-high toward the target
+    serve: [[0, 0.85, 2.7, -0.45, 170], [0.22, 0.95, 2.55, -1.0, 162], [0.45, 0.55, 2.85, 0.75, 172], [0.68, 0.45, 3.7, 1.05, 105], [1, 0.2, 4.8, 0.6, 25]],
   };
   STROKES.dink_bh = mirrorKeys(STROKES.dink_fh, 0.88);
   STROKES.volley_bh = mirrorKeys(STROKES.volley_fh, 0.75);
@@ -2567,29 +2707,43 @@ export function createGame() {
   // Whole body per stroke (forehand view; mirrored for backhands)
   //   off   = free-hand path [t, u, z, w]
   //   step  = which foot steps toward the net during the swing, and how far (ft)
-  interface BodyDef { crouch: number; lean: number; stance: number; turn0: number; turn1: number; step: 'off' | 'dom'; stepW: number; off: number[][] }
+  //   crouch1 / lean1 = where the legs and trunk finish (lob: legs drive up; smash: fold down through the ball)
+  interface BodyDef { crouch: number; lean: number; crouch1?: number; lean1?: number; stance: number; turn0: number; turn1: number; step: 'off' | 'dom'; stepW: number; off: number[][] }
   const BODY: Record<string, BodyDef> = {
-    drive: { crouch: 0.45, lean: 0.3, stance: 0.8, turn0: 0.85, turn1: -0.5, step: 'off', stepW: 0.55,
+    // athletic stance, step in, firm swing, weight through the ball
+    drive: { crouch: 0.48, lean: 0.28, crouch1: 0.38, lean1: 0.45, stance: 0.86, turn0: 0.85, turn1: -0.5, step: 'off', stepW: 0.55,
       off: [[0, -0.2, 4.0, 0.5], [0.45, -0.6, 4.1, 0.3], [1, -1.0, 4.2, -0.2]] },
     volley: { crouch: 0.5, lean: 0.35, stance: 0.82, turn0: 0.3, turn1: -0.1, step: 'off', stepW: 0.25,
       off: [[0, 0.0, 3.9, 0.6], [1, -0.55, 4.0, 0.4]] },
-    dink: { crouch: 0.78, lean: 0.5, stance: 0.9, turn0: 0.25, turn1: -0.1, step: 'dom', stepW: 0.45,
+    // low stance, soft short swing, balanced
+    dink: { crouch: 0.82, lean: 0.5, crouch1: 0.76, lean1: 0.52, stance: 0.95, turn0: 0.25, turn1: -0.1, step: 'dom', stepW: 0.45,
       off: [[0, -1.0, 3.0, 0.2], [1, -1.1, 3.1, 0.1]] },
-    lob: { crouch: 0.55, lean: 0.3, stance: 0.8, turn0: 0.5, turn1: -0.4, step: 'off', stepW: 0.3,
+    // open stance, paddle low to high, the legs lift the ball
+    lob: { crouch: 0.66, lean: 0.32, crouch1: 0.14, lean1: 0.02, stance: 0.92, turn0: 0.5, turn1: -0.4, step: 'off', stepW: 0.3,
       off: [[0, -0.7, 3.3, 0.3], [1, -0.95, 4.6, 0]] },
-    smash: { crouch: 0.12, lean: -0.1, stance: 0.62, turn0: 0.75, turn1: -0.6, step: 'off', stepW: 0.25,
+    // tall, reach up, full swing, hit down
+    smash: { crouch: 0.06, lean: -0.18, crouch1: 0.32, lean1: 0.48, stance: 0.66, turn0: 0.75, turn1: -0.6, step: 'off', stepW: 0.25,
       off: [[0, -0.3, 6.3, 0.5], [0.4, -0.4, 6.0, 0.4], [1, -0.75, 3.6, -0.2]] },
-    serve: { crouch: 0.25, lean: 0.2, stance: 0.6, turn0: 0.45, turn1: -0.4, step: 'off', stepW: 0.35,
+    serve: { crouch: 0.26, lean: 0.2, crouch1: 0.14, lean1: 0.3, stance: 0.62, turn0: 0.45, turn1: -0.4, step: 'off', stepW: 0.35,
       off: [[0, 0.4, 3.1, 0.6], [0.35, 0.42, 2.85, 0.6], [1, -0.8, 3.7, 0]] },
   };
 
+  // Receiving stances (what is coming decides the stance):
   // Ready: knees bent, weight forward, paddle up in front, free hand near the paddle
-  const READY: Pose = { hand: [0.36, 3.95, 0.55, 14], off: [0.04, 3.85, 0.55], crouch: 0.42, lean: 0.32, stance: 0.8, turn: 0, step: [0, 0, 0, 0] };
+  const READY: Pose = { hand: [0.4, 3.85, 0.7, 14], off: [0.02, 3.95, 0.6], crouch: 0.44, lean: 0.32, stance: 0.86, turn: 0, step: [0, 0, 0, 0] };
+  // vs a drive: athletic, paddle in front of the chest, ready to counter
+  const READY_DRIVE: Pose = { hand: [0.32, 3.6, 0.95, 24], off: [-0.06, 3.7, 0.8], crouch: 0.52, lean: 0.38, stance: 0.92, turn: 0, step: [0, 0, 0, 0] };
+  // vs a dink: low, soft paddle out in front near the knees, ready to block gently
+  // (paddle out in front, tip forward and slightly up, face open: like a real dink ready position)
+  const READY_LOW: Pose = { hand: [0.34, 3.0, 1.0, 38], off: [-0.22, 3.15, 0.8], crouch: 0.74, lean: 0.46, stance: 0.98, turn: 0, step: [0, 0, 0, 0] };
+  // vs a lob / high ball: tall and ready high, paddle up, prepared for an overhead
+  const READY_HIGH: Pose = { hand: [0.5, 4.9, 0.35, 6], off: [-0.25, 4.6, 0.45], crouch: 0.26, lean: 0.12, stance: 0.82, turn: 0.2, step: [0, 0, 0, 0] };
   // Between points: relaxed, paddle hanging by the side
   const IDLE: Pose = { hand: [0.72, 3.0, 0.05, 168], off: [-0.66, 3.0, 0], crouch: 0.06, lean: 0.04, stance: 0.48, turn: 0, step: [0, 0, 0, 0] };
   const CHEER: Pose = { hand: [0.5, 6.5, 0, 8], off: [-0.5, 6.4, 0], crouch: 0, lean: -0.05, stance: 0.55, turn: 0, step: [0, 0, 0, 0] };
-  // Server waiting: staggered feet, paddle back and low, ball out in front
-  const SERVE_WAIT: Pose = { hand: [0.85, 2.7, -0.45, 170], off: [0.35, 3.05, 0.6], crouch: 0.22, lean: 0.2, stance: 0.58, turn: 0.35, step: [-0.15, 0.4, 0, 0] };
+  // Server waiting: staggered feet (front foot opposite the paddle), paddle back and low,
+  // ball held out in front in the free hand (the hand follows the ball, see drawAthlete)
+  const SERVE_WAIT: Pose = { hand: [0.85, 2.7, -0.45, 170], off: [-0.74, 3.0, 0.7], crouch: 0.26, lean: 0.2, stance: 0.62, turn: 0.35, step: [-0.15, 0.45, 0, 0] };
 
   function strokePose(kind: string, t: number): Pose {
     const base = kind.split('_')[0];
@@ -2605,8 +2759,8 @@ export function createGame() {
     return {
       hand: h,
       off: o,
-      crouch: B.crouch,
-      lean: B.lean + 0.1 * Math.sin(Math.PI * clamp(t, 0, 1)),
+      crouch: lerp(B.crouch, B.crouch1 ?? B.crouch, ease(clamp(t, 0, 1))),
+      lean: lerp(B.lean, B.lean1 ?? B.lean, ease(clamp(t, 0, 1))) + 0.1 * Math.sin(Math.PI * clamp(t, 0, 1)),
       stance: B.stance,
       turn: lerp(B.turn0, B.turn1, ease(clamp(t, 0, 1))) * (bh ? -1 : 1),
       step: stepDom ? [sw, -0.12 * transfer, lift, 0] : [-0.12 * transfer, sw, 0, lift],
@@ -2623,50 +2777,161 @@ export function createGame() {
     return into;
   }
 
+  // ---- the paddle goes to the ball ----
+  const CONTACT_T = 0.45; // contact point inside every stroke path
+  const smooth01 = (a: number, b: number, x: number) => { const k = clamp((x - a) / (b - a), 0, 1); return k * k * (3 - 2 * k); };
+  /** A world point in this athlete's body coordinates [u toward the paddle hand, z, w toward the net]. */
+  function toBody(p: Athlete, x: number, y: number, z: number): number[] {
+    return [(x - p.x) * domSign(p), z, (y - p.y) * (p.team === 'ai' ? 1 : -1)];
+  }
+  /** Where the paddle face is for a hand [u, z, w, angle]: the face centre sits 0.66 ft out along the paddle. */
+  function faceOf(hand: number[]): number[] {
+    const a = (hand[3] * Math.PI) / 180;
+    return [hand[0] + Math.sin(a) * 0.66, hand[1] + Math.cos(a) * 0.66, hand[2]];
+  }
+  /**
+   * Bend a stroke so the paddle face really meets the ball: the hand path is shifted
+   * toward the contact point (most at contact, none at the start and end of the
+   * swing), and the legs bend for a low ball / stretch for a high one, like a player.
+   */
+  function reachFor(pose: Pose, kind: string, target: number[], k: number) {
+    if (k <= 0.001) return pose;
+    const key = sampleKeys(STROKES[kind] || STROKES.drive_fh, CONTACT_T);
+    // a low ball: the paddle tips down to scoop under it (forehand angles are positive, backhand negative)
+    const low = kind === 'smash' ? 0 : clamp((1.7 - target[1]) / 1.3, 0, 1);
+    if (low > 0) {
+      const sg = key[3] >= 0 ? 1 : -1;
+      const tipped = sg * lerp(Math.abs(key[3]), 148, low);
+      pose.hand[3] += (tipped - key[3]) * k;
+      key[3] = tipped;
+    }
+    const f = faceOf(key);
+    const du = clamp(target[0] - f[0], -1.6, 1.6);
+    const dz = clamp(target[1] - f[1], -3.2, 2.4);
+    const dw = clamp(target[2] - f[2], -1.8, 2.2); // late contact: reach back
+    pose.hand[0] += du * k;
+    pose.hand[1] += dz * k;
+    pose.hand[2] += dw * k;
+    if (dz < -0.3) { // bend the knees (and a little the waist), not just the arm
+      pose.crouch = Math.min(1, pose.crouch + Math.min(0.5, (-dz - 0.3) * 0.34) * k);
+      pose.lean += Math.min(0.2, (-dz - 0.3) * 0.08) * k;
+    }
+    else if (dz > 0.8) pose.crouch = Math.max(0, pose.crouch - Math.min(0.25, (dz - 0.8) * 0.15) * k);
+    pose.lean += clamp(-dz * 0.05, -0.08, 0.12) * k;
+    return pose;
+  }
+  /** Where the incoming ball should meet this player's paddle (body coordinates), or null. */
+  function predictedContact(p: Athlete): number[] | null {
+    if (ball.held || ball.netted || Math.abs(ball.vy) < 1) return null;
+    const lineY = p.y + (p.team === 'player' ? -CONTACT_IDEAL * 0.6 : CONTACT_IDEAL * 0.6);
+    let tt = (lineY - ball.y) / ball.vy;
+    if (tt < 0 || tt > 1.6) tt = 0;
+    const g = ball.g || G;
+    let z = ball.z + ball.vz * tt - 0.5 * g * tt * tt;
+    if (z < 0) z = Math.min(3.5, -z * BOUNCE_Z + 0.6); // it will bounce first: roughly where it comes up to
+    return toBody(p, ball.x + ball.vx * tt, ball.y + ball.vy * tt, clamp(z, 0.4, 7));
+  }
+
   function poseFor(p: Athlete): Pose {
     if (p.cheer > 0) return CHEER;
-    if (p.stroke) return strokePose(p.stroke, p.strokeT);
+    if (p.stroke) {
+      const pose = strokePose(p.stroke, p.strokeT);
+      if (p.cpt && p.stroke !== 'serve') {
+        const t = p.strokeT;
+        const k = t < CONTACT_T ? smooth01(0.1, CONTACT_T, t) : 1 - smooth01(CONTACT_T + 0.05, 0.85, t);
+        reachFor(pose, p.stroke, toBody(p, p.cpt.x, p.cpt.y, p.cpt.z), k);
+      }
+      return pose;
+    }
     const st = state === 'paused' ? pausedFrom : state; // hold the pose while paused
     if (st === 'serve' && p === serverAth) return SERVE_WAIT;
     const active = st === 'rally' || st === 'serve';
-    const base = active ? READY : IDLE;
-    if (p.prep > 0.01) return blendPose(clonePose(base), base, strokePose(p.prepKind, 0), p.prep); // early backswing
+    const base = active ? receivePose(p, st) : IDLE;
+    if (p.prep > 0.01) { // early backswing, set at the height the ball will arrive
+      const pose = blendPose(clonePose(base), base, strokePose(p.prepKind, 0), p.prep);
+      const c = predictedContact(p);
+      if (c) {
+        const f = faceOf(sampleKeys(STROKES[p.prepKind] || STROKES.drive_fh, CONTACT_T));
+        const dz = clamp(c[1] - f[1], -2, 2);
+        pose.hand[1] += dz * 0.6 * p.prep;
+        pose.hand[0] += clamp(c[0] - f[0], -1, 1) * 0.3 * p.prep;
+        if (dz < -0.3) pose.crouch = Math.min(0.9, pose.crouch + Math.min(0.3, (-dz - 0.3) * 0.25) * p.prep);
+      }
+      return pose;
+    }
     return base;
   }
 
+  /** The receiving stance for what the other side is sending (or a plain ready stance). */
+  function receivePose(p: Athlete, st: string): Pose {
+    const incoming = st === 'rally' && !!lastHitter && lastHitter !== p.team && !ball.netted && !ball.held;
+    if (!incoming) return READY;
+    const speed = Math.hypot(ball.vx, ball.vy);
+    if (ball.z > 6.5 || ball.vz > 12) return READY_HIGH;                     // lob / high ball
+    if (speed < 24 && Math.abs(p.y - NET_Y) < 11 && ball.z < 4) return READY_LOW; // soft ball at the kitchen
+    if (speed > 36) return READY_DRIVE;                                      // hard drive
+    return READY;
+  }
+
   // Ease every athlete's displayed pose toward its target so movements flow.
+  // Critically damped springs: limbs accelerate out of a pose and settle into the next
+  // one like a body does (no robotic snap at the start, no overshoot at the end).
+  function springTo(x: number[], v: number[], t: number[], w: number, dt: number) {
+    const e = Math.exp(-w * dt);
+    for (let i = 0; i < x.length; i++) {
+      const d = x[i] - t[i], k = v[i] + w * d;
+      x[i] = t[i] + (d + k * dt) * e;
+      v[i] = (v[i] - w * k * dt) * e;
+    }
+  }
   function updatePoseSmoothing(p: Athlete, dt: number) {
     const target = poseFor(p);
-    if (!p.vis) { p.vis = clonePose(target); return; }
-    const rate = p.stroke ? 30 : p.cheer > 0 ? 9 : 12;
-    blendPose(p.vis, p.vis, target, 1 - Math.exp(-dt * rate));
-  }
-
-  // Two-bone limb in the picture plane: returns the joint (elbow/knee).
-  // Most of a real knee's or elbow's bend points toward/away from the camera,
-  // so only part of it shows on screen.
-  function solveLimb(sx: number, sz: number, ex: number, ez: number, L1: number, L2: number, outward: number) {
-    let vx = ex - sx, vz = ez - sz;
-    let d = Math.hypot(vx, vz) || 0.001;
-    const max = (L1 + L2) * 0.995;
-    if (d > max) { ex = sx + (vx / d) * max; ez = sz + (vz / d) * max; vx = ex - sx; vz = ez - sz; d = max; }
-    const a = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
-    let h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
-    const mx = sx + (vx / d) * a, mz = sz + (vz / d) * a;
-    let px = -vz / d, pz = vx / d;
-    const overhead = vz > d * 0.45 && Math.abs(vx) < d * 0.6;
-    if (overhead) {
-      if (px * outward < 0) { px = -px; pz = -pz; }
-    } else {
-      if (pz > 0) { px = -px; pz = -pz; }
-      if (Math.abs(pz) < 0.5 && px * outward < 0) { px = -px; pz = -pz; }
-      h *= 0.28 + 0.72 * Math.abs(pz);
+    if (!p.vis || !p.visV) {
+      p.vis = clonePose(target);
+      p.visV = { hand: [0, 0, 0, 0], off: [0, 0, 0], crouch: 0, lean: 0, stance: 0, turn: 0, step: [0, 0, 0, 0] };
+      return;
     }
-    return { jx: mx + px * h, jz: mz + pz * h, ex, ez };
+    const V = p.visV, X = p.vis;
+    const swing = !!p.stroke;
+    // the paddle hand during a swing: a fast direct follow, so the face is at the ball on contact
+    if (swing) {
+      const r = p.strokeT < 0.6 ? 50 : 22;
+      const k = 1 - Math.exp(-dt * r);
+      for (let i = 0; i < 4; i++) { X.hand[i] = lerp(X.hand[i], target.hand[i], k); V.hand[i] = 0; }
+    } else springTo(X.hand, V.hand, target.hand, p.cheer > 0 ? 9 : 13, dt);
+    // free arm trails the body a little; legs and trunk carry the weight
+    const wb = swing ? 17 : p.cheer > 0 ? 8 : 10.5;
+    springTo(X.off, V.off, target.off, wb * 0.9, dt);
+    springTo(X.step, V.step, target.step, wb * 1.1, dt);
+    const a = [X.crouch, X.lean, X.stance, X.turn], av = [V.crouch, V.lean, V.stance, V.turn];
+    springTo(a, av, [target.crouch, target.lean, target.stance, target.turn], wb, dt);
+    [X.crouch, X.lean, X.stance, X.turn] = a;
+    [V.crouch, V.lean, V.stance, V.turn] = av;
   }
 
-  function drawAthlete(p: Athlete) {
-    const av = p.avatar;
+  // Two-bone limb (hip-knee-ankle, shoulder-elbow-hand) solved in 3D body space
+  // [u toward the paddle hand, z up, w toward the net]. `pole` is the way the middle
+  // joint points (knees forward and a little out, elbows down and back), so a bend
+  // foreshortens like a real limb when it is projected.
+  function ik3(a: number[], b: number[], L1: number, L2: number, pole: number[]) {
+    let dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+    let d = Math.hypot(dx, dy, dz) || 0.001;
+    const max = (L1 + L2) * 0.998;
+    let e = b;
+    if (d > max) { const k = max / d; dx *= k; dy *= k; dz *= k; d = max; e = [a[0] + dx, a[1] + dy, a[2] + dz]; }
+    const ux = dx / d, uy = dy / d, uz = dz / d;
+    const along = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
+    const h = Math.sqrt(Math.max(0, L1 * L1 - along * along));
+    const pd = pole[0] * ux + pole[1] * uy + pole[2] * uz;
+    let px = pole[0] - ux * pd, py = pole[1] - uy * pd, pz = pole[2] - uz * pd;
+    let pl = Math.hypot(px, py, pz);
+    if (pl < 1e-4) { px = -uy; py = ux; pz = 0; pl = Math.hypot(px, py) || 1; }
+    return { j: [a[0] + ux * along + (px / pl) * h, a[1] + uy * along + (py / pl) * h, a[2] + uz * along + (pz / pl) * h], e };
+  }
+
+  let heldBallDrawn = false;
+  function drawAthlete(p: Athlete, decalsOnly = false) {
+    const av = legacy2D(p.avatar);
     const away = p.team === 'player';      // your team shows its back to the camera
     const dom = domSign(p);                // screen side of the paddle hand
     const fs = away ? 1 : -1;              // net side is up the screen for you, down for the bots
@@ -2721,7 +2986,6 @@ export function createGame() {
       g.x + (u * dom + (z > 2.6 ? latLean * (z - 2.6) * 0.5 : 0)) * s,
       g.y - (z + lift + w * K * fs) * s,
     ];
-    const planeZ = (z: number, w: number) => z + w * K * fs; // depth folded into height for limb solving
 
     // ----- shadow and "you" ring -----
     const shK = 1 - hopJ * 0.2;
@@ -2755,11 +3019,50 @@ export function createGame() {
       groundEllipsePath(p.x, p.y, 1.75, 1.75);
       ctx.stroke();
     }
+    if (decalsOnly) return; // 3D players: only the shadow and rings on the ground are drawn here
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
+    // ===== a 3D skeleton in body space [u, z, w], projected with S2 =====
+    // Real proportions for a ~5'10" player: hip joint ~2.9 ft, shoulders ~4.7 ft,
+    // head ~0.6 ft wide; limbs are tapered and shaded so the figure reads as a solid body.
+    const P = (v: number[]) => S2(v[0], v[1], v[2]);
+    const fem = av.gender === 'female';
+    const lerp3 = (a: number[], b: number[], t: number) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+    const lerp2 = (a: number[], b: number[], t: number) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t)];
+    // rotate an offset (u, w) around the vertical axis by a, then add it to c
+    const rotY = (c: number[], u: number, z: number, w: number, a: number) =>
+      [c[0] + u * Math.cos(a) + w * Math.sin(a), c[1] + z, c[2] - u * Math.sin(a) + w * Math.cos(a)];
+    const THIGH = 1.42, SHIN = 1.36, ANKLE = 0.27, UPPER = 1.0, FORE = 0.98;
+
+    // A tapered, shaded body segment (thigh, calf, upper arm...): rounded ends, a muscle
+    // bulge near `at`, lit from the upper left like the court lights.
+    const rich = quality > 0;
+    const seg = (a: number[], b: number[], ra: number, rb: number, col: string, bulge = 0, at = 0.35) => {
+      const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 0.001;
+      const nx = -dy / L, ny = dx / L;
+      const RA = Math.max(0.6, ra * s), RB = Math.max(0.6, rb * s);
+      const rm = lerp(RA, RB, at) * (1 + bulge);
+      const co = Math.max(rm, 2 * rm - (RA + RB) / 2);
+      const mx = a[0] + dx * at, my = a[1] + dy * at;
+      const th = Math.atan2(ny, nx);
+      if (rich) {
+        const ls = nx * -0.55 + ny * -0.83 > 0 ? 1 : -1; // the side facing the light
+        const gr = ctx.createLinearGradient(mx + nx * rm * ls, my + ny * rm * ls, mx - nx * rm * ls, my - ny * rm * ls);
+        gr.addColorStop(0, shade(col, 0.16)); gr.addColorStop(0.42, col); gr.addColorStop(1, shade(col, -0.3));
+        ctx.fillStyle = gr;
+      } else ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(a[0] + nx * RA, a[1] + ny * RA);
+      ctx.quadraticCurveTo(mx + nx * co, my + ny * co, b[0] + nx * RB, b[1] + ny * RB);
+      ctx.arc(b[0], b[1], RB, th, th + Math.PI, true);
+      ctx.quadraticCurveTo(mx - nx * co, my - ny * co, a[0] - nx * RA, a[1] - ny * RA);
+      ctx.arc(a[0], a[1], RA, th + Math.PI, th, true);
+      ctx.closePath();
+      ctx.fill();
+    };
+
     // ----- feet -----
-    const hipZ = 2.92 - crouch * 0.62 + breathe;
     const stanceNow = lerp(pose.stance, 0.36, gaitK * 0.85) + (p.split > 0 ? 0.15 * (1 - p.split) : 0);
     const feet = [-1, 1].map(side => {
       let u = side * stanceNow;
@@ -2783,84 +3086,78 @@ export function createGame() {
     // farther foot first
     feet.sort((a, b) => (away ? b.w - a.w : a.w - b.w));
 
+    // ----- pelvis: sits back as the knees bend (athletic stance), turns less than the shoulders -----
+    const hipTurn = turn * 0.42;
+    const hipBack = -crouch * 0.3;
+    const hipHW = fem ? 0.3 : 0.28;
+    const hipJoint = (side: number, z: number) => rotY([hipSway, z, hipBack], side * hipHW, 0, 0, hipTurn);
+    let hipZ = 2.92 - crouch * 0.62 + breathe;
+    // a wide stance or a long stride lowers the pelvis, so planted feet stay on the floor
+    const maxLeg = (THIGH + SHIN) * 0.985;
+    for (const f of feet) {
+      const h = hipJoint(f.side, 0);
+      const dh = Math.hypot(f.u - h[0], f.w - h[2]);
+      if (dh < maxLeg) hipZ = Math.min(hipZ, f.z + ANKLE + Math.sqrt(maxLeg * maxLeg - dh * dh));
+    }
     const legs = feet.map(f => {
-      const hipU = f.side * 0.24 + hipSway;
-      const j = solveLimb(hipU, hipZ, f.u, planeZ(f.z + 0.1, f.w), 1.45, 1.42, f.side);
-      return { f, hip: S2(hipU, hipZ), knee: S2(j.jx, j.jz), foot: S2(j.ex, j.ez) };
+      const hip = hipJoint(f.side, hipZ);
+      const k = ik3(hip, [f.u, f.z + ANKLE, f.w], THIGH, SHIN, [f.side * 0.62, 0.05, 1]); // knees forward and out over the toes
+      return { f, ank3: k.e, hip: P(hip), knee: P(k.j), foot: P(k.e) };
     });
-    const fem = av.gender === 'female';
     const shoe = SHOES[av.shoes] || SHOES.white;
     const guard = (c: string) => !!c && c !== 'none';
-    for (const L of legs) {
-      ctx.strokeStyle = shade(skin, -0.03);
-      ctx.lineWidth = Math.max(2.4, s * (fem ? 0.37 : 0.4));
-      ctx.beginPath(); ctx.moveTo(L.hip[0], L.hip[1]); ctx.lineTo(L.knee[0], L.knee[1]); ctx.stroke();
-      ctx.strokeStyle = shade(skin, -0.1);
-      ctx.lineWidth = Math.max(2, s * (fem ? 0.28 : 0.3));
-      ctx.beginPath(); ctx.moveTo(L.knee[0], L.knee[1]); ctx.lineTo(L.foot[0], L.foot[1]); ctx.stroke();
-      // knee guard: a padded sleeve around the knee
-      if (guard(av.kneeGuard)) {
-        const ux = L.knee[0] - L.hip[0], uy = L.knee[1] - L.hip[1], ul = Math.hypot(ux, uy) || 1;
-        const dx = L.foot[0] - L.knee[0], dy = L.foot[1] - L.knee[1], dl = Math.hypot(dx, dy) || 1;
-        ctx.strokeStyle = av.kneeGuard;
-        ctx.lineWidth = Math.max(2.8, s * 0.46);
-        ctx.lineCap = 'butt';
-        ctx.beginPath();
-        ctx.moveTo(L.knee[0] - (ux / ul) * s * 0.24, L.knee[1] - (uy / ul) * s * 0.24);
-        ctx.lineTo(L.knee[0], L.knee[1]);
-        ctx.lineTo(L.knee[0] + (dx / dl) * s * 0.26, L.knee[1] + (dy / dl) * s * 0.26);
-        ctx.stroke();
-        ctx.lineCap = 'round';
-      }
-      // sock + shoe (heel up shows the sole while the foot swings through)
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(L.foot[0] - s * 0.14, L.foot[1] - s * 0.38, s * 0.28, s * 0.3);
-      const heelUp = L.f.kick > 0.25 || L.f.z > 0.12;
-      ctx.fillStyle = shoe.upper;
-      ctx.beginPath(); ctx.ellipse(L.foot[0], L.foot[1] - s * 0.04, s * 0.24, s * (heelUp ? 0.19 : 0.14), 0, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = shoe.accent;
-      ctx.fillRect(L.foot[0] - s * 0.16, L.foot[1] - s * 0.08, s * 0.32, Math.max(1, s * 0.05));
-      ctx.fillStyle = heelUp ? shoe.sole : 'rgba(0,0,0,0.28)';
-      if (heelUp) { ctx.beginPath(); ctx.ellipse(L.foot[0], L.foot[1] + s * 0.02, s * 0.2, s * 0.1, 0, 0, Math.PI * 2); ctx.fill(); }
-      else { ctx.fillStyle = shoe.sole; ctx.fillRect(L.foot[0] - s * 0.22, L.foot[1] + s * 0.06, s * 0.44, Math.max(1, s * 0.06)); }
-    }
-    // shorts: style decides the length and cut
     const shortsC = av.shortsColor || shade(shirt, -0.62);
     const sStyle = av.shortsStyle || 'classic';
-    const hw = fem ? 0.53 : 0.5;
-    ctx.fillStyle = shortsC;
-    if (sStyle === 'skort') { // flared skirt over shorts
-      const k0 = S2(-hw + hipSway, hipZ + 0.2), k1 = S2(hw + hipSway, hipZ + 0.2);
-      const k2 = S2(hw + 0.3 + hipSway, hipZ - 0.8), k3 = S2(-hw - 0.3 + hipSway, hipZ - 0.8);
-      ctx.beginPath(); ctx.moveTo(k0[0], k0[1]); ctx.lineTo(k1[0], k1[1]); ctx.lineTo(k2[0], k2[1]);
-      ctx.quadraticCurveTo((k2[0] + k3[0]) / 2, k2[1] + s * 0.12, k3[0], k3[1]); ctx.closePath(); ctx.fill();
-    } else {
-      const w0 = S2(-hw + hipSway, hipZ + 0.2), w1 = S2(hw + hipSway, hipZ + 0.2), w2 = S2(hw - 0.03 + hipSway, hipZ - 0.25), w3 = S2(-hw + 0.03 + hipSway, hipZ - 0.25);
-      ctx.beginPath(); ctx.moveTo(w0[0], w0[1]); ctx.lineTo(w1[0], w1[1]); ctx.lineTo(w2[0], w2[1]); ctx.lineTo(w3[0], w3[1]); ctx.closePath(); ctx.fill();
-      const len = ({ classic: 0.5, long: 0.78, compression: 0.36 } as Record<string, number>)[sStyle] || 0.5;
-      ctx.strokeStyle = shortsC;
-      ctx.lineWidth = Math.max(3, s * (sStyle === 'compression' ? 0.46 : 0.56));
-      ctx.lineCap = 'butt';
-      for (const L of legs) {
-        const e = [L.hip[0] + (L.knee[0] - L.hip[0]) * len, L.hip[1] + (L.knee[1] - L.hip[1]) * len];
-        ctx.beginPath(); ctx.moveTo(L.hip[0], L.hip[1] - s * 0.1); ctx.lineTo(e[0], e[1]); ctx.stroke();
-      }
-      ctx.lineCap = 'round';
+    const sLen = ({ classic: 0.5, long: 0.78, compression: 0.38, skort: 0.25 } as Record<string, number>)[sStyle] ?? 0.5;
+    const legSkin = shade(skin, -0.03);
+    for (const L of legs) {
+      const f = L.f, ank = L.ank3;
+      // shoe: heel to toe along the foot, toes turned a little out; it rolls onto the toes as it lifts
+      const heelUp = f.kick > 0.25 || f.z > 0.12;
+      const pitch = heelUp ? 0.2 : 0;
+      const floorZ = ank[1] - ANKLE;
+      const heel = P([ank[0] - f.side * 0.03, floorZ + 0.13 + pitch, ank[2] - 0.24]);
+      const toe = P([ank[0] + f.side * 0.1, floorZ + 0.1 - pitch * 0.4, ank[2] + 0.46]);
+      seg([heel[0], heel[1] + s * 0.05], [toe[0], toe[1] + s * 0.05], 0.14, 0.13, shoe.sole);
+      seg(heel, toe, 0.14, 0.125, shoe.upper);
+      ctx.strokeStyle = shoe.accent;
+      ctx.lineWidth = Math.max(1, s * 0.05);
+      ctx.beginPath(); ctx.moveTo(lerp(heel[0], toe[0], 0.2), lerp(heel[1], toe[1], 0.2) - s * 0.02); ctx.lineTo(lerp(heel[0], toe[0], 0.75), lerp(heel[1], toe[1], 0.75) - s * 0.02); ctx.stroke();
+      // calf (muscle high on the shin), sock, thigh
+      seg(L.knee, L.foot, 0.17, 0.09, shade(skin, -0.09), 0.26, 0.28);
+      seg(L.foot, lerp2(L.foot, L.knee, 0.2), 0.095, 0.11, '#f3f3f0');
+      seg(L.hip, L.knee, 0.265, 0.17, legSkin, 0.1, 0.3);
+      if (guard(av.kneeGuard)) seg(lerp2(L.hip, L.knee, 0.8), lerp2(L.knee, L.foot, 0.22), 0.2, 0.185, av.kneeGuard);
+      if (sStyle !== 'skort') seg(L.hip, lerp2(L.hip, L.knee, sLen), 0.29, sStyle === 'compression' ? 0.21 : 0.255, shortsC);
     }
-    ctx.fillStyle = shade(shortsC, -0.25); // waistband
-    const wb0 = S2(-hw + hipSway, hipZ + 0.22), wb1 = S2(hw + hipSway, hipZ + 0.1);
-    ctx.fillRect(Math.min(wb0[0], wb1[0]), wb0[1], Math.abs(wb1[0] - wb0[0]), Math.max(1.5, s * 0.1));
+    // shorts / skort over the pelvis
+    const pc = [hipSway, hipZ, hipBack];
+    const skirt = sStyle === 'skort';
+    const pp = (u: number, z: number) => P(rotY(pc, u, z, 0, hipTurn));
+    const wbL = pp(-(hipHW + 0.2), 0.36), wbR = pp(hipHW + 0.2, 0.36);
+    const hpL = pp(-(hipHW + (skirt ? 0.42 : 0.27)), skirt ? -0.78 : -0.08), hpR = pp(hipHW + (skirt ? 0.42 : 0.27), skirt ? -0.78 : -0.08);
+    const crotch = pp(0, skirt ? -0.92 : -0.34);
+    ctx.fillStyle = shortsC;
+    ctx.beginPath();
+    ctx.moveTo(wbL[0], wbL[1]); ctx.lineTo(wbR[0], wbR[1]); ctx.lineTo(hpR[0], hpR[1]);
+    ctx.quadraticCurveTo(crotch[0], crotch[1], hpL[0], hpL[1]);
+    ctx.closePath(); ctx.fill();
+    seg(wbL, wbR, 0.06, 0.06, shade(shortsC, -0.25)); // waistband
 
-    // ----- torso -----
-    const torsoLen = 1.95 * Math.cos(lean);
-    const shZ = hipZ + 0.18 + torsoLen * 0.82;
-    const topZ = hipZ + 0.18 + torsoLen;
-    const shW = 0.66 * (fem ? 0.87 : 1) * (1 - 0.3 * Math.min(1, Math.abs(turn)));
-    const waist = fem ? 0.42 : 0.47;
+    // ----- trunk: leans from the hips toward the net, shoulders turn more than the hips -----
+    const pelvTop = [hipSway, hipZ + 0.22, hipBack];
+    const TORSO = 1.56;
+    const spZ = Math.cos(lean), spW = Math.sin(lean);
+    const along = (k: number) => [pelvTop[0], pelvTop[1] + spZ * TORSO * k, pelvTop[2] + spW * TORSO * k];
+    const shC3 = along(1);
+    const halfW = fem ? 0.54 : 0.6;
+    const midTurn = (turn + hipTurn) / 2;
+    const dip = clamp((pose.hand[1] - 3.7) * 0.07, -0.14, 0.1); // the paddle shoulder drops for a low ball
+    const shoulderDom = rotY(shC3, halfW, dip, 0, turn), shoulderOff = rotY(shC3, -halfW, -dip * 0.5, 0, turn);
+    const bodyW = shC3[2] * 0.6 + hipBack * 0.4;
     const shirtStyle = av.shirtStyle || 'polo';
     const trim = av.shirtAccent || '#f5f5f2';
-    const shC = -turn * 0.14 + hipSway * 0.5;
-    const shoulderDom = [shC + shW * 0.92, shZ], shoulderOff = [shC - shW * 0.92, shZ];
+    const tank = shirtStyle === 'tank';
 
     // ----- arms -----
     const hand = pose.hand.slice();
@@ -2877,60 +3174,58 @@ export function createGame() {
       else { hand[2] -= 0.4 * domFwd; }
     }
     if (shufK > 0.01) { hand[1] += 0.05 * Math.sin(Math.PI * 2 * shufC) * shufK; }
-    if (st === 'serve' && p === serverAth && !p.stroke) { // free hand holds the ball
-      const bp = proj(ball.x, ball.y, ball.z);
-      off = [((bp.x - g.x) / s) * dom, (g.y - bp.y) / s - lift, 0];
+    // Serving: the free hand holds the ball out in front, carries it across and lets it drop
+    const winding = !!serveWind && serveWind.who === p;
+    const servingBall = st === 'serve' && p === serverAth && ball.held && (!p.stroke || winding);
+    let ballW = 0; // the ball's distance in front of the body (toward the net)
+    if (servingBall) {
+      ballW = (ball.y - p.y) * (p.team === 'ai' ? 1 : -1);
+      const wt = winding ? (serveWind as { t: number }).t : -1;
+      if (wt >= SERVE_CARRY) { // let go: the open hand stays up, then clears the swing
+        const k = clamp((wt - SERVE_CARRY) / SERVE_FALL, 0, 1);
+        off = [lerp(SERVE_RELEASE[0] - 0.12, -0.3, ease(k)), SERVE_RELEASE[1] - 0.18 - 0.35 * k, lerp(SERVE_RELEASE[2], 0.45, k)];
+      } else { // palm under the ball, exactly where the ball is drawn
+        const bp = proj(ball.x, ball.y, ball.z);
+        off = [((bp.x - g.x) / s) * dom, (g.y - bp.y) / s - lift - ballW * K * fs - 0.18, ballW];
+      }
     }
 
-    const arm = (sh: number[], tgt: number[], outward: number) => {
-      const j = solveLimb(sh[0], sh[1], tgt[0], planeZ(tgt[1], tgt[2]), 1.0, 0.95, outward);
-      return { sh: S2(sh[0], sh[1]), el: S2(j.jx, j.jz), hd: S2(j.ex, j.ez) };
+    const arm = (sh0: number[], tgt: number[], side: number) => {
+      let sh = sh0;
+      // a long reach pulls the shoulder blade along instead of leaving the hand short
+      const d = Math.hypot(tgt[0] - sh[0], tgt[1] - sh[1], tgt[2] - sh[2]);
+      const max = (UPPER + FORE) * 0.98;
+      if (d > max) sh = lerp3(sh, tgt, Math.min(0.42, d - max) / d);
+      const up = clamp((tgt[1] - sh[1]) / 1.1, 0, 1);        // hand above the shoulder: elbow out and up
+      const across = clamp((-tgt[0] * side) / 0.7, 0, 1);   // hand across the body: elbow forward
+      const pole = [
+        side * lerp(lerp(0.5, 0.85, up), -0.15, across),
+        lerp(lerp(-1, 0.3, up), -0.5, across),
+        lerp(lerp(-0.4, -0.45, up), 0.7, across),
+      ];
+      const j = ik3(sh, tgt, UPPER, FORE, pole);
+      return { sh: P(sh), el: P(j.j), hd: P(j.e) };
     };
     const offArm = arm(shoulderOff, off, -1);
     const domArm = arm(shoulderDom, hand, 1);
     type ArmPts = ReturnType<typeof arm>;
 
     const drawLimbs = (A: ArmPts) => {
-      ctx.strokeStyle = shade(skin, -0.06);
-      ctx.lineWidth = Math.max(1.8, s * 0.23);
-      ctx.beginPath(); ctx.moveTo(A.el[0], A.el[1]); ctx.lineTo(A.hd[0], A.hd[1]); ctx.stroke();
-      ctx.strokeStyle = shade(skin, -0.02);
-      ctx.lineWidth = Math.max(2, s * 0.28);
-      ctx.beginPath(); ctx.moveTo(A.sh[0], A.sh[1]); ctx.lineTo(A.el[0], A.el[1]); ctx.stroke();
-      // elbow guard: padded sleeve centred on the elbow
-      if (guard(av.elbowGuard)) {
-        const ex = A.hd[0] - A.el[0], ey = A.hd[1] - A.el[1], el = Math.hypot(ex, ey) || 1;
-        const ux = A.el[0] - A.sh[0], uy = A.el[1] - A.sh[1], ul = Math.hypot(ux, uy) || 1;
-        ctx.strokeStyle = av.elbowGuard;
-        ctx.lineWidth = Math.max(2.2, s * 0.33);
-        ctx.lineCap = 'butt';
-        ctx.beginPath();
-        ctx.moveTo(A.el[0] - (ux / ul) * s * 0.18, A.el[1] - (uy / ul) * s * 0.18);
-        ctx.lineTo(A.el[0], A.el[1]);
-        ctx.lineTo(A.el[0] + (ex / el) * s * 0.2, A.el[1] + (ey / el) * s * 0.2);
-        ctx.stroke();
-        ctx.lineCap = 'round';
-      }
-      if (shirtStyle === 'tank') return; // sleeveless
-      const sl = [A.sh[0] + (A.el[0] - A.sh[0]) * 0.55, A.sh[1] + (A.el[1] - A.sh[1]) * 0.55];
-      ctx.strokeStyle = shirtStyle === 'raglan' ? trim : shade(shirt, -0.06);
-      ctx.lineWidth = Math.max(2.6, s * (fem ? 0.35 : 0.38));
-      ctx.beginPath(); ctx.moveTo(A.sh[0], A.sh[1]); ctx.lineTo(sl[0], sl[1]); ctx.stroke();
-      if (shirtStyle !== 'raglan') { // trim at the sleeve hem
-        const t0 = [A.sh[0] + (A.el[0] - A.sh[0]) * 0.47, A.sh[1] + (A.el[1] - A.sh[1]) * 0.47];
-        ctx.strokeStyle = trim;
-        ctx.lineCap = 'butt';
-        ctx.beginPath(); ctx.moveTo(t0[0], t0[1]); ctx.lineTo(sl[0], sl[1]); ctx.stroke();
-        ctx.lineCap = 'round';
-      }
+      seg(A.el, A.hd, 0.1, 0.068, shade(skin, -0.06), 0.16, 0.25);   // forearm
+      seg(A.sh, A.el, 0.15, 0.1, shade(skin, -0.01), 0.12, 0.35);    // upper arm
+      if (guard(av.elbowGuard)) seg(lerp2(A.sh, A.el, 0.8), lerp2(A.el, A.hd, 0.22), 0.145, 0.13, av.elbowGuard);
+      if (tank) { seg(A.sh, lerp2(A.sh, A.el, 0.32), 0.17, 0.15, skin); return; } // bare deltoid
+      const end = lerp2(A.sh, A.el, 0.5);
+      seg(A.sh, end, 0.2, 0.16, shirtStyle === 'raglan' ? trim : shade(shirt, -0.04));
+      if (shirtStyle !== 'raglan') seg(lerp2(A.sh, A.el, 0.44), end, 0.165, 0.16, trim); // sleeve hem
     };
     // A loose hand (fingers together, slightly longer than wide)
     const drawOpenHand = (A: ArmPts) => {
       const ang = Math.atan2(A.hd[1] - A.el[1], A.hd[0] - A.el[0]);
       ctx.fillStyle = skin;
-      ctx.beginPath(); ctx.ellipse(A.hd[0] + Math.cos(ang) * s * 0.07, A.hd[1] + Math.sin(ang) * s * 0.07, s * 0.16, s * 0.11, ang, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(A.hd[0] + Math.cos(ang) * s * 0.07, A.hd[1] + Math.sin(ang) * s * 0.07, s * 0.13, s * 0.085, ang, 0, Math.PI * 2); ctx.fill();
       ctx.strokeStyle = rgba(shade(skin, -0.35), 0.5);
-      ctx.lineWidth = Math.max(0.6, s * 0.03);
+      ctx.lineWidth = Math.max(0.6, s * 0.025);
       ctx.stroke();
     };
 
@@ -2951,10 +3246,10 @@ export function createGame() {
       ctx.translate(domArm.hd[0] + pdx * s * 0.04, domArm.hd[1] + pdy * s * 0.04);
       ctx.rotate(ga);
       ctx.fillStyle = skin;
-      ctx.beginPath(); ctx.ellipse(0, 0, s * 0.15, s * 0.17, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(0, 0, s * 0.12, s * 0.135, 0, 0, Math.PI * 2); ctx.fill();
       ctx.strokeStyle = rgba(shade(skin, -0.4), 0.55);
-      ctx.lineWidth = Math.max(0.6, s * 0.035);
-      ctx.beginPath(); ctx.moveTo(s * 0.04, -s * 0.13); ctx.lineTo(s * 0.04, s * 0.13); ctx.stroke(); // knuckles
+      ctx.lineWidth = Math.max(0.6, s * 0.03);
+      ctx.beginPath(); ctx.moveTo(s * 0.035, -s * 0.1); ctx.lineTo(s * 0.035, s * 0.1); ctx.stroke(); // knuckles
       ctx.restore();
     };
     const drawOffArm = () => { drawLimbs(offArm); drawOpenHand(offArm); };
@@ -2971,83 +3266,108 @@ export function createGame() {
     }
 
     // Anything on the far side of the body from the camera is drawn first
-    const hidden = (w: number) => (away ? w > 0.08 : w < -0.08);
+    const hidden = (w: number) => (away ? w > bodyW + 0.1 : w < bodyW - 0.1);
+    // the server's ball is drawn with the body so it sits in front of / behind it correctly
+    // (it used to be painted over the back of a player facing away from the camera)
+    if (servingBall && hidden(ballW)) { drawBall(); heldBallDrawn = true; }
     if (hidden(off[2])) drawOffArm();
     if (hidden(hand[2])) drawPaddleArm();
 
+    // neck and head (the head carries forward over the chest with the lean)
+    const neckBase = rotY(shC3, 0, 0.2, 0, turn);
+    const headC = [shC3[0] * 0.8, shC3[1] + 0.3 * spZ + 0.5, shC3[2] + 0.3 * spW + 0.08];
+    seg(P(neckBase), P([headC[0], headC[1] - 0.3, headC[2] - 0.02]), 0.125, 0.11, shade(skin, -0.12));
+
+    // shirt: waist -> lats/chest -> armpits -> shoulder caps -> trapezius -> neck
     if (quality === 0) ctx.fillStyle = shirt;
     else {
       const tg = ctx.createLinearGradient(g.x - s * 0.7, 0, g.x + s * 0.7, 0);
       tg.addColorStop(0, shade(shirt, 0.14 - turn * 0.08));
-      tg.addColorStop(1, shade(shirt, -0.24 - turn * 0.08));
+      tg.addColorStop(0.55, shade(shirt, -0.04 - turn * 0.08));
+      tg.addColorStop(1, shade(shirt, -0.26 - turn * 0.08));
       ctx.fillStyle = tg;
     }
-    const tank = shirtStyle === 'tank';
-    if (tank) { // bare shoulders show around the straps
-      const so = S2(shoulderOff[0], shZ), sd = S2(shoulderDom[0], shZ);
-      const torsoFill = ctx.fillStyle;
-      ctx.save();
-      ctx.fillStyle = shade(skin, -0.02);
-      ctx.beginPath(); ctx.ellipse((so[0] + sd[0]) / 2, so[1] + s * 0.05, Math.abs(sd[0] - so[0]) / 2 + s * 0.08, s * 0.24, 0, Math.PI, 0); ctx.fill();
-      ctx.restore();
-      ctx.fillStyle = torsoFill;
-    }
-    const topK = tank ? 0.42 : 0.68;
-    const t0 = S2(-waist + hipSway, hipZ + 0.15), t1 = S2(shoulderOff[0] - (tank ? -0.12 : 0.06), shZ), t2 = S2(shC - shW * topK, topZ);
-    const t3 = S2(shC + shW * topK, topZ), t4 = S2(shoulderDom[0] + (tank ? -0.12 : 0.06), shZ), t5 = S2(waist + hipSway, hipZ + 0.15);
+    const waistW = fem ? 0.4 : 0.45;
+    // each side: waist -> lat -> armpit -> round deltoid over the real shoulder joint -> trapezius -> neck
+    const side3 = (sd: number) => {
+      const dz = sd > 0 ? dip : -dip * 0.5;
+      const o = tank ? 0.62 : 1;
+      return {
+        W: P(rotY(pelvTop, sd * waistW, -0.04, 0, hipTurn)),
+        C: P(rotY(along(0.5), sd * halfW * (fem ? 0.86 : 0.98), 0, 0, midTurn)),
+        A: P(rotY(along(0.78), sd * halfW * (tank ? 0.76 : 0.98), dz * 0.6, 0, turn)),
+        D: P(rotY(shC3, sd * (halfW * o + (tank ? 0 : 0.13)), dz - 0.12, 0, turn)),
+        Dc: P(rotY(shC3, sd * (halfW * o + (tank ? 0.02 : 0.14)), dz + 0.16, 0, turn)),
+        T: P(rotY(shC3, sd * halfW * o * 0.72, dz + 0.2, 0, turn)),
+        Tc: P(rotY(shC3, sd * 0.3, 0.27, 0, turn)),
+        N: P(rotY(shC3, sd * (tank ? 0.15 : 0.18), 0.34, 0, turn)),
+      };
+    };
+    const LT = side3(-1), RT = side3(1);
     ctx.beginPath();
-    ctx.moveTo(t0[0], t0[1]);
-    ctx.lineTo(t1[0], t1[1]);
-    ctx.quadraticCurveTo(t1[0], t2[1], t2[0], t2[1]);
-    ctx.lineTo(t3[0], t3[1]);
-    ctx.quadraticCurveTo(t4[0], t3[1], t4[0], t4[1]);
-    ctx.lineTo(t5[0], t5[1]);
+    ctx.moveTo(LT.W[0], LT.W[1]);
+    ctx.quadraticCurveTo(LT.C[0], LT.C[1], LT.A[0], LT.A[1]);
+    ctx.lineTo(LT.D[0], LT.D[1]);
+    ctx.quadraticCurveTo(LT.Dc[0], LT.Dc[1], LT.T[0], LT.T[1]);
+    ctx.quadraticCurveTo(LT.Tc[0], LT.Tc[1], LT.N[0], LT.N[1]);
+    ctx.lineTo(RT.N[0], RT.N[1]);
+    ctx.quadraticCurveTo(RT.Tc[0], RT.Tc[1], RT.T[0], RT.T[1]);
+    ctx.quadraticCurveTo(RT.Dc[0], RT.Dc[1], RT.D[0], RT.D[1]);
+    ctx.lineTo(RT.A[0], RT.A[1]);
+    ctx.quadraticCurveTo(RT.C[0], RT.C[1], RT.W[0], RT.W[1]);
     ctx.closePath();
     ctx.fill();
-    if (shirtStyle === 'raglan') { // contrasting shoulder panels
+    if (shirtStyle === 'raglan') { // contrasting shoulder panels from the collar
       ctx.fillStyle = trim;
-      for (const side of [-1, 1]) {
-        const a1 = S2(shC + side * shW * 0.2, topZ), a2 = S2(shC + side * shW * 0.68, topZ), a3 = S2(shC + side * (shW + 0.06), shZ), a4 = S2(shC + side * shW * 0.8, shZ - 0.35);
-        ctx.beginPath(); ctx.moveTo(a1[0], a1[1]); ctx.lineTo(a2[0], a2[1]); ctx.lineTo(a3[0], a3[1]); ctx.lineTo(a4[0], a4[1]); ctx.closePath(); ctx.fill();
+      for (const T of [LT, RT]) {
+        ctx.beginPath(); ctx.moveTo(T.N[0], T.N[1]); ctx.quadraticCurveTo(T.Tc[0], T.Tc[1], T.T[0], T.T[1]); ctx.quadraticCurveTo(T.Dc[0], T.Dc[1], T.D[0], T.D[1]); ctx.lineTo(T.A[0], T.A[1]);
+        ctx.lineTo(lerp(T.A[0], T.N[0], 0.35), lerp(T.A[1], T.N[1], 0.35)); ctx.closePath(); ctx.fill();
       }
     }
+    // soft shading: the shirt drapes into the waistband
+    if (rich) {
+      const wa = P(along(0)), wb2 = P(along(0.35));
+      const sg = ctx.createLinearGradient(0, wa[1], 0, wb2[1]);
+      sg.addColorStop(0, 'rgba(0,0,0,0.22)'); sg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = sg;
+      ctx.beginPath();
+      ctx.moveTo(LT.W[0], LT.W[1]); ctx.lineTo(RT.W[0], RT.W[1]); ctx.lineTo(RT.W[0], wb2[1]); ctx.lineTo(LT.W[0], wb2[1]); ctx.closePath();
+      ctx.fill();
+    }
+    const q = s * 0.8; // collar details, scaled to the slimmer neck
+    const c = P(rotY(shC3, 0, 0.33, 0, turn));
     if (!away) { // neckline on the front
-      const c = S2(shC, topZ);
       ctx.fillStyle = shade(skin, -0.08);
       ctx.strokeStyle = trim;
-      ctx.lineWidth = Math.max(1, s * 0.07);
+      ctx.lineWidth = Math.max(1, q * 0.07);
       if (shirtStyle === 'polo') {
-        ctx.beginPath(); ctx.moveTo(c[0] - s * 0.18, c[1]); ctx.lineTo(c[0] + s * 0.18, c[1]); ctx.lineTo(c[0], c[1] + s * 0.32); ctx.closePath(); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(c[0] - q * 0.18, c[1]); ctx.lineTo(c[0] + q * 0.18, c[1]); ctx.lineTo(c[0], c[1] + q * 0.32); ctx.closePath(); ctx.fill();
         ctx.fillStyle = trim; // collar points
-        ctx.beginPath(); ctx.moveTo(c[0] - s * 0.22, c[1] - s * 0.02); ctx.lineTo(c[0] - s * 0.02, c[1] + s * 0.3); ctx.lineTo(c[0] - s * 0.14, c[1] + s * 0.3); ctx.closePath(); ctx.fill();
-        ctx.beginPath(); ctx.moveTo(c[0] + s * 0.22, c[1] - s * 0.02); ctx.lineTo(c[0] + s * 0.02, c[1] + s * 0.3); ctx.lineTo(c[0] + s * 0.14, c[1] + s * 0.3); ctx.closePath(); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(c[0] - q * 0.22, c[1] - q * 0.02); ctx.lineTo(c[0] - q * 0.02, c[1] + q * 0.3); ctx.lineTo(c[0] - q * 0.14, c[1] + q * 0.3); ctx.closePath(); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(c[0] + q * 0.22, c[1] - q * 0.02); ctx.lineTo(c[0] + q * 0.02, c[1] + q * 0.3); ctx.lineTo(c[0] + q * 0.14, c[1] + q * 0.3); ctx.closePath(); ctx.fill();
       } else if (shirtStyle === 'vneck') {
-        ctx.beginPath(); ctx.moveTo(c[0] - s * 0.18, c[1]); ctx.lineTo(c[0] + s * 0.18, c[1]); ctx.lineTo(c[0], c[1] + s * 0.36); ctx.closePath(); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(c[0] - q * 0.18, c[1]); ctx.lineTo(c[0] + q * 0.18, c[1]); ctx.lineTo(c[0], c[1] + q * 0.36); ctx.closePath(); ctx.fill(); ctx.stroke();
       } else if (tank) {
-        ctx.beginPath(); ctx.ellipse(c[0], c[1], s * 0.22, s * 0.2, 0, 0, Math.PI); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.ellipse(c[0], c[1], q * 0.22, q * 0.2, 0, 0, Math.PI); ctx.fill(); ctx.stroke();
       } else { // crew / raglan
-        ctx.beginPath(); ctx.ellipse(c[0], c[1], s * 0.17, s * 0.1, 0, 0, Math.PI); ctx.fill(); ctx.stroke();
+        ctx.beginPath(); ctx.ellipse(c[0], c[1], q * 0.17, q * 0.1, 0, 0, Math.PI); ctx.fill(); ctx.stroke();
       }
     } else if (shirtStyle === 'polo') { // polo collar band seen from behind
-      const c0 = S2(shC - 0.24, topZ), c1 = S2(shC + 0.24, topZ);
       ctx.fillStyle = trim;
-      ctx.fillRect(Math.min(c0[0], c1[0]), c0[1] - s * 0.04, Math.abs(c1[0] - c0[0]), Math.max(1.5, s * 0.13));
-    } else { // spine shading
+      ctx.fillRect(c[0] - q * 0.24, c[1] - q * 0.04, q * 0.48, Math.max(1.5, q * 0.13));
+    } else { // spine and shoulder blades
       ctx.strokeStyle = 'rgba(0,0,0,0.12)';
-      ctx.lineWidth = Math.max(1, s * 0.05);
-      const a = S2(shC, topZ - 0.15), b = S2(hipSway, hipZ + 0.35);
+      ctx.lineWidth = Math.max(1, s * 0.045);
+      const a = P(along(0.9)), b = P(along(0.15));
       ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
     }
 
-    // neck + head (the head drops forward with the lean)
-    const nk = S2(shC * 0.7, topZ);
-    ctx.fillStyle = shade(skin, -0.12);
-    ctx.fillRect(nk[0] - s * 0.13, nk[1] - s * 0.3, s * 0.26, s * 0.34);
-    const hd = S2(shC * 0.6, topZ + 0.52);
-    drawHeadBillboard(ctx, av, hd[0], hd[1], s * 0.42, away ? 'back' : 'front', p.gait || p.phase, quality === 0);
+    const hd = P(headC);
+    drawHeadBillboard(ctx, av, hd[0], hd[1], s * 0.315, away ? 'back' : 'front', p.gait || p.phase, quality === 0);
 
     if (!hidden(off[2])) drawOffArm();
     if (!hidden(hand[2])) drawPaddleArm();
+    if (servingBall && !hidden(ballW)) { drawBall(); heldBallDrawn = true; }
   }
 
   // ---------- referees on umpire chairs ----------
@@ -3123,6 +3443,7 @@ export function createGame() {
 
     ctx.fillStyle = 'rgba(0,0,0,0.25)';
     ctx.beginPath(); ctx.ellipse(g.x + s * 0.3, g.y, s * 1.1, s * 0.35, 0, 0, Math.PI * 2); ctx.fill();
+    if (use3D) return; // the umpire, chair and flags are drawn by the 3D layer
 
     // umpire chair: legs, rungs, seat and backrest
     ctx.strokeStyle = '#8a94a3';
@@ -3225,6 +3546,7 @@ export function createGame() {
       ctx.fillStyle = ball.power ? 'rgba(255,80,30,0.45)' : 'rgba(255,154,60,0.35)';
       ctx.beginPath(); ctx.arc(0, 0, r * (ball.power ? 2.8 : 2), 0, Math.PI * 2); ctx.fill();
     }
+    if (use3D) { ctx.restore(); return; } // the ball itself is 3D
     const grad = ctx.createRadialGradient(-r * 0.35, -r * 0.35, 0.5, 0, 0, r);
     grad.addColorStop(0, '#fbffc4');
     grad.addColorStop(1, '#c6d81c');
@@ -3720,10 +4042,7 @@ export function createGame() {
     drawCourtSurface();
     drawLightPools();
     drawDividers();
-    drawBench(DIVIDER_X[0] + 2.2, 13, 1);
-    drawBench(DIVIDER_X[0] + 2.2, 33, 1);
-    drawBench(DIVIDER_X[1] - 2.2, 13, -1);
-    drawBench(DIVIDER_X[1] - 2.2, 33, -1);
+    for (const b of BENCHES) drawBench(b.x, b.y, b.facing);
   }
   function drawScenery() {
     const key = [VIEW_W, VIEW_H, cam.f.toFixed(2), cam.hor.toFixed(2), quality].join('|');
@@ -3752,23 +4071,38 @@ export function createGame() {
     const target = state === 'menu' ? 0 : -(player.x - COURT_W / 2) * 0.35 * (cam.f / (cam.y - 28));
     cam.pan += (target - cam.pan) * 0.06;
 
+    const ox = cam.pan + (shake > 0 ? rand(-shake, shake) : 0), oy = shake > 0 ? rand(-shake, shake) : 0;
+    view3D.ox = ox; view3D.oy = oy;
     ctx.save();
-    ctx.translate(cam.pan + (shake > 0 ? rand(-shake, shake) : 0), shake > 0 ? rand(-shake, shake) : 0);
+    ctx.translate(ox, oy);
 
-    drawScenery();
-    drawCourtOverlays();
-    drawLanding();
-    drawBallShadow();
+    heldBallDrawn = false;
+    if (!use3D) { // in 3D the hall, court, shadows, people, umpires and net are all drawn by the 3D layer
+      drawScenery();
+      drawCourtOverlays();
+      drawLanding();
+      drawBallShadow();
+      // People and the net, far to near (the server draws the ball it is holding)
+      const items: { y: number; draw: () => void }[] = roster.map(a => ({ y: a.y, draw: () => drawAthlete(a) }));
+      for (const r of refs) items.push({ y: r.y - 0.01, draw: () => drawRef(r) });
+      items.push({ y: NET_Y, draw: drawNet });
+      items.sort((a, b) => a.y - b.y);
+      for (const it of items) it.draw();
+    }
 
-    // People and the net, far to near
-    const items: { y: number; draw: () => void }[] = roster.map(a => ({ y: a.y, draw: () => drawAthlete(a) }));
-    for (const r of refs) items.push({ y: r.y - 0.01, draw: () => drawRef(r) });
-    items.push({ y: NET_Y, draw: drawNet });
-    items.sort((a, b) => a.y - b.y);
-    for (const it of items) it.draw();
+    if (use3D) { // everything from here on is drawn over the 3D players
+      ctx.restore();
+      frontPic = null;
+      const c2 = frontRecorder.beginRecording(Skia.XYWHRect(0, 0, VIEW_W, VIEW_H));
+      if (!frontCtx) frontCtx = new Ctx2D(c2);
+      else frontCtx.reset(c2);
+      ctx = frontCtx;
+      ctx.save();
+      ctx.translate(ox, oy);
+    }
 
     drawParticles();
-    drawBall();
+    if (!heldBallDrawn) drawBall();
     drawNameTags();
     drawFloaters();
     drawCues();
@@ -4266,8 +4600,95 @@ export function createGame() {
     ctx = frameCtx;
     draw();
     const pic = frameRecorder.finishRecordingAsPicture();
+    if (use3D && ctx === frontCtx) frontPic = frontRecorder.finishRecordingAsPicture();
+    ctx = frameCtx;
     adaptQuality(now, Date.now() - t0, interval);
     return pic;
+  }
+
+  // ---------- 3D players ----------
+  /** Turn the 3D player layer on (after it loaded) or off (back to the drawn 2D players). */
+  function set3D(on: boolean) { use3D = on; frontPic = null; }
+  /** The foreground picture of the last frame (only in 3D mode): drawn above the 3D layer. */
+  function overlay(): SkPicture | null { return use3D ? frontPic : null; }
+  /** Everything painted on the floor this frame (the same marks the 2D view draws), for the 3D floor. */
+  function decals3D(): Decal3D[] {
+    const d: Decal3D[] = [];
+    const quad = (x0: number, y0: number, x1: number, y1: number, c: string, a: number): Decal3D => ({ k: 'quad', x: x0, y: y0, x1, y1, rx: 0, ry: 0, c, a });
+    d.push(quad(-1, NET_Y, COURT_W + 1, NET_Y + 1.1, '#000000', 0.18)); // net shadow
+    if (state === 'serve' && serveBox) d.push(quad(serveBox.x0, serveBox.y0, serveBox.x1, serveBox.y1, '#d7f23b', 0.12 + 0.08 * Math.sin(clock * 5)));
+    if (state === 'rally' && lastHitter === 'ai' && bounces === 0 && shots >= 3 && inKitchen('player', player.y)) {
+      d.push(quad(0, NET_Y, COURT_W, BOT_KITCHEN, '#ff5050', 0.14 + 0.06 * Math.sin(clock * 14)));
+    }
+    if (landing && state === 'rally') {
+      const r = 0.7 + Math.sin(clock * 12) * 0.1;
+      d.push({ k: 'dash', x: landing.x, y: landing.y, rx: r, ry: r, w: 0.09, c: '#ffffff', a: 0.55, rot: -clock * 2 });
+    }
+    d.push({ k: 'disc', soft: true, x: ball.x, y: ball.y, rx: 0.3, ry: 0.3, c: '#000000', a: clamp(0.5 - ball.z * 0.035, 0.1, 0.5) });
+    for (const r of refs) d.push({ k: 'disc', soft: true, x: r.x, y: r.y, rx: 1.3, ry: 1.0, c: '#000000', a: 0.3 });
+    for (const p of roster) {
+      const hop = p.jump > 0 ? Math.sin((1 - p.jump) * Math.PI) : 0;
+      d.push({ k: 'disc', soft: true, x: p.x + 0.12, y: p.y + 0.1, rx: 1.05 * (1 - hop * 0.2), ry: 0.7 * (1 - hop * 0.2), c: '#000000', a: 0.42 });
+      if (p.human && p.en.hyperT > 0) { // Hyper mode: electric ring under the player
+        const pulse = 0.5 + 0.5 * Math.sin(clock * 14);
+        d.push({ k: 'ring', x: p.x, y: p.y, rx: 1.6 + pulse * 0.35, ry: 1.6 + pulse * 0.35, w: 0.14, c: '#7cf2ff', a: 0.6 + 0.35 * pulse });
+        d.push({ k: 'disc', x: p.x, y: p.y, rx: 2.2, ry: 2.2, c: '#7cf2ff', a: 0.14 + 0.08 * pulse });
+      }
+      if (p === player && p.queued && p.swing > 0) { // a shot is ready and waiting for the ball
+        const r = 1.95 + 0.25 * Math.sin(clock * 12);
+        d.push({ k: 'ring', x: p.x, y: p.y, rx: r, ry: r, w: 0.12, c: '#d7f23b', a: 0.9 });
+      }
+      if (p.human) {
+        d.push({ k: 'ring', x: p.x, y: p.y, rx: 1.35, ry: 1.35, w: 0.09, c: '#ffffff', a: 0.65 + 0.25 * Math.sin(clock * 4) });
+        d.push({ k: 'ring', x: p.x, y: p.y, rx: 1.75, ry: 1.75, w: 0.09, c: '#3aa0ff', a: 0.55 });
+      }
+    }
+    return d;
+  }
+  /** Who has the ball on their palm: waiting to serve and carrying it to the drop (not after it is let go). */
+  function heldBy3D(): string | null {
+    if (!ball.held || (serveWind && serveWind.t >= SERVE_CARRY)) return null;
+    const who = serveWind ? serveWind.who : serverAth;
+    return Math.hypot(ball.x - who.x, ball.y - who.y) < 2.5 && ball.z < 5.5 ? who.id : null;
+  }
+  /** Where this player's paddle meets the ball in the current stroke (world feet), if known. */
+  function contactFor(a: Athlete): { x: number; y: number; z: number } | null {
+    if (!a.stroke) return null;
+    if (a.cpt) return { ...a.cpt };
+    if (serveWind && serveWind.who === a) { // the serve: the ball drops to the paddle in front of the hip
+      const towardNet = a.team === 'ai' ? 1 : -1;
+      return { x: a.x + domSign(a) * SERVE_RELEASE[0], y: a.y + towardNet * SERVE_RELEASE[2], z: SERVE_CONTACT_Z };
+    }
+    return null;
+  }
+  /** Everything the 3D layer needs to draw this frame, in court feet (x across, y along, z up). */
+  function scene3D(): Scene3D {
+    const st = state === 'paused' ? pausedFrom : state;
+    return {
+      w: VIEW_W, h: VIEW_H,
+      cam: { x: cam.x, y: cam.y, h: cam.h, f: cam.f, cx: cam.cx + view3D.ox, hor: cam.hor + view3D.oy },
+      paused: state === 'paused',
+      clock,
+      ball: {
+        x: ball.x, y: ball.y, z: ball.z, spin: ball.spin, squash: ball.squash,
+        visible: true,
+        // in the server's hand until it is let go during the serve
+        holder: heldBy3D(),
+      },
+      hall: { left: HALL.left, right: HALL.right, back: HALL.back, ceil: HALL.ceil, pad: HALL.pad, near: hallNear(), lights: LIGHTS, dividers: DIVIDER_X, benches: BENCHES },
+      decals: decals3D(),
+      refs: refs.map(r => ({ x: r.x, y: r.y, face: r.face, pose: r.pose, look: r.look, target: r.target ? { ...r.target } : null })),
+      athletes: roster.map(a => ({
+        id: a.id, team: a.team, lefty: a.lefty, x: a.x, y: a.y, vx: a.vx, vy: a.vy,
+        lift: (a.jump > 0 ? Math.sin((1 - a.jump) * Math.PI) : 0) + (a.split > 0 ? Math.sin((1 - a.split) * Math.PI) * 0.3 : 0),
+        stroke: a.stroke, strokeT: a.strokeT, prep: a.prep, prepKind: a.prepKind,
+        inRally: st === 'rally', cheer: a.cheer > 0,
+        avatar: a.avatar, paddle: a.paddle,
+        serving: st === 'serve' && a === serverAth && !a.stroke,
+        serverMark: st === 'serve' && a === serverAth,
+        contact: contactFor(a),
+      })),
+    };
   }
 
   function resize(w: number, h: number) {
@@ -4349,6 +4770,8 @@ export function createGame() {
     frame,
     resize,
     runLoader,
+    // 3D players
+    set3D, overlay, scene3D,
     autoPause,
     // input
     touchStart, touchMove, touchEnd, releaseAllTouches,
@@ -4370,6 +4793,15 @@ export function createGame() {
       score: { player: score.player, ai: score.ai }, server, serverIsMe: serverAth === player,
       held: ball.held, rallies: rallyLog.slice(), netHold, role: netRole, gameWinner,
       bvx: ball.vx, bvy: ball.vy, bvz: ball.vz, queued: !!player.queued,
+      // the ball relative to the server's body [u toward the paddle hand, z up, w toward the net]
+      serveBall: [(ball.x - serverAth.x) * domSign(serverAth), ball.z, (ball.y - serverAth.y) * (serverAth.team === 'ai' ? 1 : -1)],
+      serveWindT: serveWind ? serveWind.t : -1, serverStroke: serverAth.stroke, serverStrokeT: serverAth.strokeT,
+      // your swing: where the paddle face is (target pose and what is drawn) vs where the ball was hit
+      swing: player.stroke && player.cpt ? {
+        kind: player.stroke, t: player.strokeT,
+        face: faceOf(poseFor(player).hand), drawn: player.vis ? faceOf(player.vis.hand) : null,
+        ball: toBody(player, player.cpt.x, player.cpt.y, player.cpt.z), crouch: poseFor(player).crouch,
+      } : null,
     }),
     // cloud
     setProfile: applyProfile,

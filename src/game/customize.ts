@@ -29,6 +29,9 @@ export interface Avatar {
   facial: string; headwear: string; hatColor: string; shirt: string;
   shirtStyle: string; shirtAccent: string; shortsStyle: string; shortsColor: string;
   shoes: string; kneeGuard: string; elbowGuard: string;
+  // sports gear (each a real 3D item; mix and match)
+  headband: string; bandColor: string; eyewear: string; wristband: string;
+  kneeStyle: string; elbowStyle: string;
 }
 export type AvatarKey = keyof Avatar;
 
@@ -53,7 +56,9 @@ export const OPTIONS: Record<AvatarKey, Option[]> = {
     { v: 'none', n: 'None' }, { v: 'stubble', n: 'Stubble' }, { v: 'mustache', n: 'Mustache' }, { v: 'beard', n: 'Beard' },
   ],
   headwear: [
-    { v: 'none', n: 'None' }, { v: 'cap', n: 'Cap' }, { v: 'visor', n: 'Visor' }, { v: 'headband', n: 'Headband' },
+    { v: 'none', n: 'None' },
+    { v: 'cap', n: 'Classic cap' }, { v: 'cap_flat', n: 'Flat-brim cap' }, { v: 'cap_trucker', n: 'Trucker cap' }, { v: 'cap_back', n: 'Backwards cap' },
+    { v: 'visor', n: 'Classic visor' }, { v: 'visor_wide', n: 'Wide visor' }, { v: 'visor_pro', n: 'Pro visor' },
   ],
   hatColor: [
     { v: '#1d4e89', n: 'Navy' }, { v: '#f2f2f0', n: 'White' }, { v: '#1b1b1b', n: 'Black' }, { v: '#c0392b', n: 'Red' },
@@ -67,6 +72,7 @@ export const OPTIONS: Record<AvatarKey, Option[]> = {
   shirtStyle: [
     { v: 'polo', n: 'Polo' }, { v: 'crew', n: 'T-shirt' }, { v: 'vneck', n: 'V-neck' },
     { v: 'tank', n: 'Tank top' }, { v: 'raglan', n: 'Raglan' },
+    { v: 'pro', n: 'Pro panel tee' }, { v: 'stripe', n: 'Chest-stripe tee' }, { v: 'sleeveless', n: 'Sleeveless' },
   ],
   shirtAccent: [
     { v: '#f5f5f2', n: 'White' }, { v: '#1b1b1b', n: 'Black' }, { v: '#1d4e89', n: 'Navy' }, { v: '#d64545', n: 'Red' },
@@ -74,6 +80,8 @@ export const OPTIONS: Record<AvatarKey, Option[]> = {
   ],
   shortsStyle: [
     { v: 'classic', n: 'Classic' }, { v: 'long', n: 'Long' }, { v: 'compression', n: 'Compression' }, { v: 'skort', n: 'Skort' },
+    { v: 'stripe', n: 'Side-stripe' },
+    { v: 'track', n: 'Track pants' }, { v: 'jogger', n: 'Joggers' }, { v: 'tights', n: 'Full tights' },
   ],
   shortsColor: [
     { v: '#1f2a44', n: 'Navy' }, { v: '#1b1b1d', n: 'Black' }, { v: '#eceff3', n: 'White' }, { v: '#6b7280', n: 'Gray' },
@@ -82,6 +90,22 @@ export const OPTIONS: Record<AvatarKey, Option[]> = {
   shoes: Object.keys(SHOES).map(k => ({ v: k, n: SHOES[k].n })),
   kneeGuard: GUARD_COLORS,
   elbowGuard: GUARD_COLORS,
+  headband: [
+    { v: 'none', n: 'None' }, { v: 'band', n: 'Terry band' }, { v: 'band_thin', n: 'Thin band' }, { v: 'band_tie', n: 'Tie band' },
+  ],
+  bandColor: [
+    { v: '#f2f2f0', n: 'White' }, { v: '#1b1b1b', n: 'Black' }, { v: '#1d4e89', n: 'Navy' }, { v: '#c0392b', n: 'Red' },
+    { v: '#c7d93b', n: 'Lime' }, { v: '#2bb3a3', n: 'Teal' }, { v: '#7b4bb3', n: 'Purple' }, { v: '#e86a9a', n: 'Pink' },
+  ],
+  eyewear: [
+    { v: 'none', n: 'None' }, { v: 'sport', n: 'Sport shades' }, { v: 'round', n: 'Round shades' },
+    { v: 'clear', n: 'Clear sport' }, { v: 'mirror', n: 'Mirror shield' },
+  ],
+  wristband: [
+    { v: 'none', n: 'None' }, { v: 'single', n: 'One wrist' }, { v: 'pair', n: 'Both wrists' }, { v: 'pro', n: 'Long pro bands' },
+  ],
+  kneeStyle: [{ v: 'sleeve', n: 'Sleeve' }, { v: 'pad', n: 'Padded' }, { v: 'strap', n: 'Strap' }],
+  elbowStyle: [{ v: 'sleeve', n: 'Sleeve' }, { v: 'pad', n: 'Padded' }, { v: 'strap', n: 'Strap' }],
 };
 export const AVATAR_KEYS = Object.keys(OPTIONS) as AvatarKey[];
 export const DEFAULT_AVATAR: Avatar = {
@@ -90,7 +114,25 @@ export const DEFAULT_AVATAR: Avatar = {
   facial: 'none', headwear: 'cap', hatColor: '#1d4e89', shirt: '#2f80ed',
   shirtStyle: 'polo', shirtAccent: '#f5f5f2', shortsStyle: 'classic', shortsColor: '#1f2a44',
   shoes: 'white', kneeGuard: 'none', elbowGuard: 'none',
+  headband: 'none', bandColor: '#f2f2f0', eyewear: 'none', wristband: 'none', kneeStyle: 'sleeve', elbowStyle: 'sleeve',
 };
+
+/**
+ * The 2D drawings (menu portrait, 2D fallback players) know the original items: show the
+ * nearest one for the newer 3D designs.
+ */
+export function legacy2D<T extends Partial<Avatar>>(a: T): T {
+  const o = { ...a };
+  const hw = o.headwear || 'none';
+  if (hw.startsWith('cap')) o.headwear = 'cap';
+  else if (hw.startsWith('visor')) o.headwear = 'visor';
+  else if (hw === 'none' && o.headband && o.headband !== 'none') o.headwear = 'headband';
+  if (o.shirtStyle === 'pro' || o.shirtStyle === 'stripe') o.shirtStyle = 'crew';
+  if (o.shirtStyle === 'sleeveless') o.shirtStyle = 'tank';
+  if (o.shortsStyle === 'stripe') o.shortsStyle = 'classic';
+  if (o.shortsStyle === 'track' || o.shortsStyle === 'jogger' || o.shortsStyle === 'tights') o.shortsStyle = 'long';
+  return o;
+}
 
 // =====================================================================
 //  Paddles — original designs (fictional brands)
@@ -152,17 +194,20 @@ export const BOTS: Record<'cpu1' | 'cpu2' | 'mate', Look> = {
   cpu1: {
     name: 'Bot Player 1', paddle: 'ember-blaze',
     avatar: { gender: 'male', skin: '#e9bf9f', hair: 'short', hairColor: '#3b2a1f', eyes: '#3d6c93', facial: 'stubble', headwear: 'none', hatColor: '#1b1b1b', shirt: '#d64545',
-      shirtStyle: 'crew', shirtAccent: '#1b1b1b', shortsStyle: 'classic', shortsColor: '#1b1b1d', shoes: 'black', kneeGuard: 'none', elbowGuard: '#1b1b1d' },
+      shirtStyle: 'pro', shirtAccent: '#1b1b1b', shortsStyle: 'classic', shortsColor: '#1b1b1d', shoes: 'black', kneeGuard: 'none', elbowGuard: '#1b1b1d',
+      headband: 'none', bandColor: '#1b1b1b', eyewear: 'sport', wristband: 'single', kneeStyle: 'sleeve', elbowStyle: 'strap' },
   },
   cpu2: {
     name: 'Bot Player 2', paddle: 'apex-volt',
     avatar: { gender: 'female', skin: '#87553a', hair: 'ponytail', hairColor: '#1d1815', eyes: '#4a2e1d', facial: 'none', headwear: 'visor', hatColor: '#f2f2f0', shirt: '#f08a3c',
-      shirtStyle: 'tank', shirtAccent: '#f5f5f2', shortsStyle: 'skort', shortsColor: '#eceff3', shoes: 'pink', kneeGuard: 'none', elbowGuard: 'none' },
+      shirtStyle: 'tank', shirtAccent: '#f5f5f2', shortsStyle: 'skort', shortsColor: '#eceff3', shoes: 'pink', kneeGuard: 'none', elbowGuard: 'none',
+      headband: 'none', bandColor: '#f2f2f0', eyewear: 'none', wristband: 'pair', kneeStyle: 'sleeve', elbowStyle: 'sleeve' },
   },
   mate: {
     name: 'Bot Player 3', paddle: 'glacier-frost',
-    avatar: { gender: 'male', skin: '#d29d74', hair: 'curly', hairColor: '#1d1815', eyes: '#4a2e1d', facial: 'beard', headwear: 'headband', hatColor: '#f2f2f0', shirt: '#2bb3a3',
-      shirtStyle: 'raglan', shirtAccent: '#f5f5f2', shortsStyle: 'long', shortsColor: '#1f2a44', shoes: 'neon', kneeGuard: '#1b1b1d', elbowGuard: 'none' },
+    avatar: { gender: 'male', skin: '#d29d74', hair: 'curly', hairColor: '#1d1815', eyes: '#4a2e1d', facial: 'beard', headwear: 'none', hatColor: '#f2f2f0', shirt: '#2bb3a3',
+      shirtStyle: 'raglan', shirtAccent: '#f5f5f2', shortsStyle: 'long', shortsColor: '#1f2a44', shoes: 'neon', kneeGuard: '#1b1b1d', elbowGuard: 'none',
+      headband: 'band', bandColor: '#f2f2f0', eyewear: 'none', wristband: 'none', kneeStyle: 'pad', elbowStyle: 'sleeve' },
   },
 };
 
@@ -655,7 +700,8 @@ export function paddleSprite(id: string, scale: number): PaddleSprite {
 //  Avatar portrait (front view, natural 2D illustration)
 //  Drawn on a 200 x 220 design grid, scaled to fit.
 // =====================================================================
-export function drawPortrait(ctx: Ctx2D, a: Avatar, W: number, H: number): void {
+export function drawPortrait(ctx: Ctx2D, look: Avatar, W: number, H: number): void {
+  const a = legacy2D(look);
   ctx.save();
   ctx.clearRect(0, 0, W, H);
   ctx.scale(W / 200, H / 220);
@@ -1103,7 +1149,8 @@ export function drawPortrait(ctx: Ctx2D, a: Avatar, W: number, H: number): void 
 //  Full-body preview (front view) — shows the whole outfit
 //  Drawn on a 120 x 260 design grid.
 // =====================================================================
-export function drawBodyPreview(ctx: Ctx2D, a: Avatar, paddle: Paddle | null, W: number, H: number): void {
+export function drawBodyPreview(ctx: Ctx2D, look: Avatar, paddle: Paddle | null, W: number, H: number): void {
+  const a = legacy2D(look);
   ctx.save();
   ctx.clearRect(0, 0, W, H);
   ctx.scale(W / 120, H / 260);
@@ -1489,7 +1536,12 @@ export function cleanName(n: unknown): string {
 function sanitizeAvatar(a: unknown): Avatar {
   const out: Avatar = { ...DEFAULT_AVATAR };
   if (a && typeof a === 'object') {
-    const src = a as Record<string, unknown>;
+    const src = { ...(a as Record<string, unknown>) };
+    if (src.headwear === 'headband') { // older profiles: the headband was a headwear choice
+      src.headwear = 'none';
+      if (src.headband === undefined) src.headband = 'band';
+      if (src.bandColor === undefined) src.bandColor = src.hatColor;
+    }
     for (const k of AVATAR_KEYS) if (OPTIONS[k].some(o => o.v === src[k])) out[k] = src[k] as string;
   }
   return out;

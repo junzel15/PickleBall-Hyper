@@ -85,6 +85,13 @@ android {
         versionCode 1
         versionName "1.0"
     }
+    // react-native-webgpu (3D players) links libwebgpu_dawn.so but does not package it:
+    // without this the app crashes at launch with "library libwebgpu_dawn.so not found".
+    sourceSets {
+        main {
+            jniLibs.srcDirs += ["${rootDir}/../node_modules/react-native-webgpu-dawn/libs/android"]
+        }
+    }
     signingConfigs {
         debug {
             storeFile file('debug.keystore')

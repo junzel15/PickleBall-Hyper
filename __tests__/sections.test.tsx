@@ -228,9 +228,11 @@ describe('customize player & paddles', () => {
       const ui = { profile: { name: 'Hana', age: 30, avatar: av, paddle: 'tidal-wave' } } as never;
       let r!: ReactTestRenderer.ReactTestRenderer;
       act(() => { r = ReactTestRenderer.create(<CustomizeScreen game={game} ui={ui} short={h <= 560} />); });
-      expectAll(textsOf(r), ['Customize player', 'YOUR PLAYER', 'LIVE PREVIEW', 'PLAYER NAME', 'EQUIPPED PADDLE', 'TIDAL', 'Player', 'Outfit', 'Paddle', 'SAVE & BACK', 'SKIN TONE']);
+      expectAll(textsOf(r), ['Customize player', 'YOUR PLAYER', 'LIVE PREVIEW · 3D', 'PLAYER NAME', 'EQUIPPED PADDLE', 'TIDAL', 'Player', 'Outfit', 'Paddle', 'SAVE & BACK', 'SKIN TONE']);
       press(r, 'Outfit');
-      expectAll(textsOf(r), ['T-SHIRT STYLE', 'SHOES']);
+      expectAll(textsOf(r), ['T-SHIRTS', 'SHORTS', 'LONG SPORTS PANTS', 'SHOES']);
+      press(r, 'Gear');
+      expectAll(textsOf(r), ['CAPS & VISORS', 'HEADBANDS', 'SPORTS GLASSES', 'WRISTBANDS', 'KNEE GUARDS', 'ELBOW GUARDS']);
       press(r, 'Paddle');
       const t = textsOf(r);
       expectAll(t, ['POWER', 'CONTROL', 'All', 'Pro', 'Signature', 'Classic', 'HEXA', 'PRISM', 'GRAND PRIX']);
@@ -247,6 +249,41 @@ describe('customize player & paddles', () => {
       expect(closeCustomize).toHaveBeenCalledWith(expect.objectContaining({ paddle: 'hexa-honeycomb', name: 'Hana' }));
       expect(PADDLES.some((p: { id: string }) => p.id === 'hexa-honeycomb')).toBe(true);
       act(() => r.unmount());
+    });
+  }
+});
+
+describe('screen headers: the caption above every title is fully visible', () => {
+  const { StyleSheet } = require('react-native');
+  // A caption row with flex: 1 inside the header's title column collapses to zero height
+  // (the caption was drawn half cut off over the title on phones). It must size to its text.
+  function captionRowOk(r: ReactTestRenderer.ReactTestRenderer, caption: string) {
+    const t = r.root.findAllByType(Text).find(x => [].concat(x.props.children).join('') === caption);
+    if (!t) throw new Error(`caption "${caption}" not rendered`);
+    const row = t.parent as ReactTestRenderer.ReactTestInstance;
+    const st = StyleSheet.flatten(row.props.style) || {};
+    expect(st.flex ?? 0).toBe(0);
+    expect(st.height ?? 1).not.toBe(0);
+    const ts = StyleSheet.flatten(t.props.style) || {};
+    expect(ts.lineHeight).toBeGreaterThanOrEqual(ts.fontSize); // room for the whole glyph
+  }
+  for (const [label, w, h] of SIZES) {
+    test(`at ${label}`, async () => {
+      setScreen(w, h);
+      mockAccount = { ...mockAccount, userId: 'u0', email: 'hana@example.com' };
+      const { DEFAULT_AVATAR: av } = require('../src/game/customize');
+      const { CustomizeScreen } = require('../src/ui/CustomizeScreen');
+      const game = { closeCustomize: jest.fn(), setCustomizeSaver: jest.fn() } as never;
+      const cases: [React.ReactElement, string][] = [
+        [<CustomizeScreen game={game} ui={{ profile: { name: 'Hana', age: 30, avatar: av, paddle: 'tidal-wave' } } as never} short={false} />, 'LOOK · OUTFIT · PADDLE'],
+        [<HistoryScreen onBack={jest.fn()} onOpen={jest.fn()} />, 'VS COMPUTER'],
+        [<TutorialModal short={false} onClose={jest.fn()} onPractice={jest.fn()} />, 'TUTORIAL · STEP 1 OF 12'],
+      ];
+      for (const [el, caption] of cases) {
+        const r = await render(el);
+        captionRowOk(r, caption);
+        act(() => r.unmount());
+      }
     });
   }
 });

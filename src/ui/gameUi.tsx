@@ -239,9 +239,11 @@ export function Panel({ title, right, children, z, style, flex }: {
 /** Small uppercase section caption with a lime accent tick (used by every menu). */
 export function SectionTitle({ text, z }: { text: string; z: (n: number) => number }) {
   return (
-    <View style={[s.row, s.flex1, { gap: z(6) }]}>
+    // flexShrink (not flex: 1): inside a column (screen headers, sheets) flex: 1 squeezed the
+    // caption to zero height, so it was drawn half cut off over the title.
+    <View style={[s.row, s.capRow, { gap: z(6) }]}>
       <View style={[s.tick, { width: z(3), height: z(11), borderRadius: z(2) }]} />
-      <Text style={[s.kicker, { fontSize: z(9.5) }]} numberOfLines={1}>{text}</Text>
+      <Text style={[s.kicker, s.capText, { fontSize: z(9.5), lineHeight: z(14) }]} numberOfLines={1}>{text}</Text>
     </View>
   );
 }
@@ -277,7 +279,7 @@ export function MenuSheet({ kicker, title, icon, children, ui, maxWidth = 400, z
             </View>
             <View style={s.flex1}>
               <SectionTitle text={kicker} z={z} />
-              <Text style={[s.title, { fontSize: z(25) }]} numberOfLines={1}>{title}</Text>
+              <Text style={[s.title, { fontSize: z(25), lineHeight: z(31) }]} numberOfLines={1}>{title}</Text>
             </View>
           </View>
           {children}
@@ -462,7 +464,7 @@ export function ScreenFrame({ title, kicker, onBack, right, children, ui, zIndex
           </Tap>
           <View style={s.flex1}>
             {kicker ? <SectionTitle text={kicker} z={z} /> : null}
-            <Text style={[s.title, { fontSize: z(22) }]} numberOfLines={1}>{title}</Text>
+            <Text style={[s.title, { fontSize: z(22), lineHeight: z(28) }]} numberOfLines={1}>{title}</Text>
           </View>
           {right}
         </View>
@@ -503,7 +505,9 @@ const s = StyleSheet.create({
     borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)', backgroundColor: 'rgba(255,255,255,0.07)',
   },
   backText: { color: C.text, fontWeight: '800', letterSpacing: 0.3 },
-  title: { color: C.text, fontWeight: '900' },
+  title: { color: C.text, fontWeight: '900', includeFontPadding: false },
+  capRow: { flexShrink: 1, minWidth: 0 },
+  capText: { flexShrink: 1, includeFontPadding: false },
   kicker: { color: C.muted, fontWeight: '900', letterSpacing: 1.4 },
   seg: { flexDirection: 'row', backgroundColor: 'rgba(0,0,0,0.32)' },
   segBtn: { flex: 1, alignItems: 'center', justifyContent: 'center' },

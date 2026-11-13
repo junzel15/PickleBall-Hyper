@@ -63,6 +63,7 @@ export interface Snapshot {
 export type MatchEvent =
   | { k: 'hit'; s: number; t: TeamW; ty: ShotW; sk: string; sm: boolean; hy: boolean; p: [number, number, number]; b: BallW; n: number }
   | { k: 'serve'; s: number; t: TeamW; b: BallW }
+  | { k: 'wind'; s: number }   // the server started the serve motion (older guests ignore it)
   | { k: 'ref'; r: 0 | 1; p: string; x: string; c?: string; tg?: [number, number]; w?: boolean; s?: string; i?: boolean; d?: number }
   | { k: 'refx'; x: string }
   | { k: 'float'; x: number; y: number; tx: string; c: string; s: number }

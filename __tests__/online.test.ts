@@ -542,3 +542,25 @@ describe('online 2 vs 2 between four engines', () => {
     expect(T.host.debug().px).toBe(hostX);
   });
 });
+
+describe('online serve motion', () => {
+  test('the guest sees the host server\'s wind-up and ball drop before the serve', () => {
+    const T = table('singles', 60);
+    begin(T);
+    const dt = 1 / 60;
+    for (let t = 0; t < 5 && !(T.host.debug().state === 'serve' && T.guest.debug().state === 'serve'); t += dt) T.tick(dt);
+    expect(T.host.debug().serverSeat).toBe(0); // the host serves first
+    T.host.testInput({ tap: 'drive' });
+    expect(T.hostMsgs.some(m => (m as { e?: { k?: string } }).e?.k === 'wind')).toBe(true);
+    let guestWound = false, served = false;
+    for (let t = 0; t < 2 && !served; t += dt) {
+      T.tick(dt);
+      const g = T.guest.debug();
+      if (g.state === 'serve' && g.serveWindT > 0) guestWound = true;
+      if (g.state === 'rally') served = true;
+    }
+    expect(guestWound).toBe(true);
+    expect(served).toBe(true);
+    expect(T.guest.debug().serveWindT).toBe(-1); // cleared by the serve
+  });
+});

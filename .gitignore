@@ -87,3 +87,7 @@ keystore.properties
 
 # Local secrets for supabase/configure-auth.mjs (never commit)
 supabase/.secrets.local
+
+# build outputs
+*.apk
+*.aab

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pickleball Player Viewer</title>
+<style>
+  :root { --bg: #e9edf1; --panel: rgba(255,255,255,0.92); --ink: #1b2430; --muted: #5d6b7a; --accent: #1e6db5; --line: #d3dae2; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #11161c; --panel: rgba(24,30,38,0.92); --ink: #e8edf2; --muted: #9aa8b6; --accent: #5aa2e6; --line: #2c3642; } }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #ui { position: absolute; left: 16px; right: 16px; bottom: 16px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; backdrop-filter: blur(6px); }
+  #ui button { font: inherit; border: 1px solid var(--line); background: transparent; color: var(--ink); padding: 6px 10px; border-radius: 7px; cursor: pointer; }
+  #ui button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #ui label { color: var(--muted); display: flex; gap: 6px; align-items: center; margin-left: auto; }
+  #info { position: absolute; top: 12px; left: 16px; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="info">Drag to orbit · scroll to zoom</div>
+<div id="ui"></div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const GLB = '__GLB_BASE64__';
+const bytes = Uint8Array.from(atob(GLB), c => c.charCodeAt(0));
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+scene.background = new THREE.Color(dark ? 0x11161c : 0xe9edf1);
+const camera = new THREE.PerspectiveCamera(35, 1, 0.05, 50);
+camera.position.set(2.2, 1.5, 3.4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.95, 0);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xdfe9ff, 0x5a5040, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(2.5, 5, 3.5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -2, right: 2, top: 2.5, bottom: -1, near: 0.5, far: 12 });
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0xbfd4ff, 0.6);
+fill.position.set(-3, 2, -2);
+scene.add(fill);
+
+// court floor with a kitchen line
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(12, 12), new THREE.MeshStandardMaterial({ color: 0x2f6f9a, roughness: 0.9 }));
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+const line = new THREE.Mesh(new THREE.PlaneGeometry(12, 0.05), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8 }));
+line.rotation.x = -Math.PI / 2; line.position.set(0, 0.002, 1.2);
+scene.add(line);
+
+let mixer, actions = {}, current, skeleton, speed = 1;
+new GLTFLoader().parse(bytes.buffer, '', gltf => {
+  const model = gltf.scene;
+  model.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  scene.add(model);
+  skeleton = new THREE.SkeletonHelper(model);
+  skeleton.visible = false;
+  scene.add(skeleton);
+  mixer = new THREE.AnimationMixer(model);
+  const ui = document.getElementById('ui');
+  for (const clip of gltf.animations) {
+    const a = mixer.clipAction(clip);
+    const loops = clip.name === 'Idle' || clip.name === 'Ready' || clip.name === 'Run' || clip.name.startsWith('Strafe');
+    if (!loops && clip.name !== 'TPose') { a.setLoop(THREE.LoopRepeat); }
+    actions[clip.name] = a;
+    const b = document.createElement('button');
+    b.textContent = clip.name;
+    b.onclick = () => play(clip.name);
+    b.dataset.clip = clip.name;
+    ui.appendChild(b);
+  }
+  const lab = document.createElement('label');
+  lab.innerHTML = 'Speed <input type="range" min="0.1" max="1.5" step="0.05" value="1"> <button type="button">Skeleton</button>';
+  lab.querySelector('input').oninput = e => { speed = +e.target.value; };
+  lab.querySelector('button').onclick = e => { skeleton.visible = !skeleton.visible; e.target.classList.toggle('on', skeleton.visible); };
+  ui.appendChild(lab);
+  play('Idle');
+}, err => { document.getElementById('info').textContent = 'Failed to load model: ' + err; });
+
+function play(name) {
+  const next = actions[name];
+  if (!next || next === current) return;
+  next.reset().play();
+  if (current) current.crossFadeTo(next, 0.25, false);
+  current = next;
+  document.querySelectorAll('#ui button[data-clip]').forEach(b => b.classList.toggle('on', b.dataset.clip === name));
+}
+
+const clock = new THREE.Clock();
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  if (mixer) mixer.update(dt * speed);
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>

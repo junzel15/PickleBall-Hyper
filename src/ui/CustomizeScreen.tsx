@@ -9,30 +9,41 @@ import {
   FINISH_NAMES, OPTIONS, Paddle, PADDLES, paddleById, Profile, saveProfile, SHAPE_NAMES, SHOES,
 } from '../game/customize';
 import { Drawing, Tap } from './common';
+import type { AvatarStage3D as AvatarStage3DType } from './AvatarStage3D';
+import { is3DOff } from './players3dGuard';
 import { Columns, Field, GameButton, GhostButton, Icon, Panel, ScreenFrame, Segments, useUiScale } from './gameUi';
 import { C } from './theme';
 
 type GroupType = 'chip' | 'swatch' | 'shoe' | 'guard';
-const GROUPS: { key: AvatarKey; label: string; type: GroupType; panel: 'avatar' | 'outfit' }[] = [
+type Panel3 = 'avatar' | 'outfit' | 'gear';
+const PANTS = ['track', 'jogger', 'tights'];
+const GROUPS: { key: AvatarKey; label: string; type: GroupType; panel: Panel3; only?: (v: string) => boolean; show?: (a: Avatar) => boolean }[] = [
   { key: 'gender', label: 'Gender', type: 'chip', panel: 'avatar' },
   { key: 'skin', label: 'Skin tone', type: 'swatch', panel: 'avatar' },
   { key: 'hair', label: 'Hair style', type: 'chip', panel: 'avatar' },
   { key: 'hairColor', label: 'Hair color', type: 'swatch', panel: 'avatar' },
   { key: 'eyes', label: 'Eye color', type: 'swatch', panel: 'avatar' },
   { key: 'facial', label: 'Facial hair', type: 'chip', panel: 'avatar' },
-  { key: 'headwear', label: 'Headwear', type: 'chip', panel: 'avatar' },
-  { key: 'hatColor', label: 'Headwear color', type: 'swatch', panel: 'avatar' },
-  { key: 'shirtStyle', label: 'T-shirt style', type: 'chip', panel: 'outfit' },
+  { key: 'shirtStyle', label: 'T-shirts', type: 'chip', panel: 'outfit' },
   { key: 'shirt', label: 'T-shirt color', type: 'swatch', panel: 'outfit' },
-  { key: 'shirtAccent', label: 'Trim / sleeve color', type: 'swatch', panel: 'outfit' },
-  { key: 'shortsStyle', label: 'Shorts style', type: 'chip', panel: 'outfit' },
-  { key: 'shortsColor', label: 'Shorts color', type: 'swatch', panel: 'outfit' },
+  { key: 'shirtAccent', label: 'Trim / panel color', type: 'swatch', panel: 'outfit' },
+  { key: 'shortsStyle', label: 'Shorts', type: 'chip', panel: 'outfit', only: v => !PANTS.includes(v) },
+  { key: 'shortsStyle', label: 'Long sports pants', type: 'chip', panel: 'outfit', only: v => PANTS.includes(v) },
+  { key: 'shortsColor', label: 'Shorts / pants color', type: 'swatch', panel: 'outfit' },
   { key: 'shoes', label: 'Shoes', type: 'shoe', panel: 'outfit' },
-  { key: 'kneeGuard', label: 'Knee guards', type: 'guard', panel: 'outfit' },
-  { key: 'elbowGuard', label: 'Elbow guards', type: 'guard', panel: 'outfit' },
+  { key: 'headwear', label: 'Caps & visors', type: 'chip', panel: 'gear' },
+  { key: 'hatColor', label: 'Cap / visor color', type: 'swatch', panel: 'gear', show: a => a.headwear !== 'none' },
+  { key: 'headband', label: 'Headbands', type: 'chip', panel: 'gear' },
+  { key: 'eyewear', label: 'Sports glasses', type: 'chip', panel: 'gear' },
+  { key: 'wristband', label: 'Wristbands', type: 'chip', panel: 'gear' },
+  { key: 'bandColor', label: 'Headband / wristband color', type: 'swatch', panel: 'gear', show: a => a.headband !== 'none' || a.wristband !== 'none' },
+  { key: 'kneeGuard', label: 'Knee guards', type: 'guard', panel: 'gear' },
+  { key: 'kneeStyle', label: 'Knee guard style', type: 'chip', panel: 'gear', show: a => a.kneeGuard !== 'none' },
+  { key: 'elbowGuard', label: 'Elbow guards', type: 'guard', panel: 'gear' },
+  { key: 'elbowStyle', label: 'Elbow guard style', type: 'chip', panel: 'gear', show: a => a.elbowGuard !== 'none' },
 ];
 
-type Tab = 'avatar' | 'outfit' | 'paddle';
+type Tab = Panel3 | 'paddle';
 type Line = 'all' | 'PRO SERIES' | 'SIGNATURE' | 'CLASSIC';
 const lineOf = (p: Paddle): Exclude<Line, 'all'> => p.series ?? 'CLASSIC';
 
@@ -77,6 +88,9 @@ export function CustomizeScreen({ game, ui, short }: { game: Game; ui: UiState; 
       // guards are optional gear: leave them off most of the time
       if (Math.random() < 0.6) avatar.kneeGuard = 'none';
       if (Math.random() < 0.7) avatar.elbowGuard = 'none';
+      if (Math.random() < 0.6) avatar.eyewear = 'none';
+      if (Math.random() < 0.6) avatar.headband = 'none';
+      if (Math.random() < 0.6) avatar.wristband = 'none';
       return { ...d, avatar };
     });
   };
@@ -86,16 +100,17 @@ export function CustomizeScreen({ game, ui, short }: { game: Game; ui: UiState; 
   const shown = useMemo(() => PADDLES.filter(p => line === 'all' || lineOf(p) === line), [line]);
 
   // ---- left: live preview, name, selected paddle, save ----
-  const bodyH = z(landscape ? 196 : 210), bodyW = Math.round((bodyH * 120) / 260);
+  const bodyH = z(landscape ? 196 : 210), bodyW = Math.round(bodyH * 0.64); // room for the 3D player to turn
   const left = (
     <Panel z={z} title="YOUR PLAYER" flex={landscape} style={{ padding: z(12), gap: z(10) }}>
       <ScrollView style={landscape ? s.flex1 : null} contentContainerStyle={{ gap: z(10) }} showsVerticalScrollIndicator={false} bounces={false} scrollEnabled={landscape}>
         <View style={[s.row, { gap: z(12) }]}>
           <View style={[s.stage, { borderRadius: z(14), padding: z(4) }]}>
-            <Drawing width={bodyW} height={bodyH} style={{ borderRadius: z(11) }} deps={[avatarKey, pd.id, bodyW, bodyH]}
-              draw={ctx => drawBodyPreview(ctx, draft.avatar, pd, bodyW, bodyH)} />
-            <View style={[s.stageTag, { borderRadius: z(8), paddingHorizontal: z(7), paddingVertical: z(2), bottom: z(8) }]}>
-              <Text style={[s.stageTagText, { fontSize: z(9) }]}>LIVE PREVIEW</Text>
+            <Stage3D width={bodyW} height={bodyH} avatar={draft.avatar} paddle={pd.id}
+              fallback={<Drawing width={bodyW} height={bodyH} style={{ borderRadius: z(11) }} deps={[avatarKey, pd.id, bodyW, bodyH]}
+                draw={ctx => drawBodyPreview(ctx, draft.avatar, pd, bodyW, bodyH)} />} />
+            <View pointerEvents="none" style={[s.stageTag, { borderRadius: z(8), paddingHorizontal: z(7), paddingVertical: z(2), bottom: z(8) }]}>
+              <Text style={[s.stageTagText, { fontSize: z(9) }]}>LIVE PREVIEW · 3D</Text>
             </View>
           </View>
           <View style={[s.flex1, { gap: z(9) }]}>
@@ -122,13 +137,13 @@ export function CustomizeScreen({ game, ui, short }: { game: Game; ui: UiState; 
   );
 
   // ---- right: the editor ----
-  const groups = (panel: 'avatar' | 'outfit') => (
+  const groups = (panel: Panel3) => (
     <View style={[s.groups, { gap: z(12) }]}>
-      {GROUPS.filter(g => g.panel === panel && !(g.key === 'facial' && draft.avatar.gender === 'female')).map(g => (
-        <View key={g.key} style={{ gap: z(6) }}>
+      {GROUPS.filter(g => g.panel === panel && !(g.key === 'facial' && draft.avatar.gender === 'female') && (!g.show || g.show(draft.avatar))).map(g => (
+        <View key={g.key + g.label} style={{ gap: z(6) }}>
           <Text style={[s.kickerText, { fontSize: z(10) }]}>{g.label.toUpperCase()}</Text>
           <View style={[s.wrap, { gap: z(7) }]}>
-            {OPTIONS[g.key].map(o => {
+            {OPTIONS[g.key].filter(o => !g.only || g.only(o.v)).map(o => {
               const active = draft.avatar[g.key] === o.v;
               const label = `${g.label}: ${o.n}`;
               if (g.type === 'swatch') {
@@ -223,7 +238,7 @@ export function CustomizeScreen({ game, ui, short }: { game: Game; ui: UiState; 
   const right = (
     <Panel z={z} flex={landscape} style={{ padding: z(12), gap: z(10) }}>
       <Segments z={z} value={tab} onPick={setTab} options={[
-        { v: 'avatar', label: 'Player' }, { v: 'outfit', label: 'Outfit' }, { v: 'paddle', label: 'Paddle' },
+        { v: 'avatar', label: 'Player' }, { v: 'outfit', label: 'Outfit' }, { v: 'gear', label: 'Gear' }, { v: 'paddle', label: 'Paddle' },
       ]} />
       {landscape ? (
         <ScrollView style={s.flex1} contentContainerStyle={{ paddingBottom: z(6) }} showsVerticalScrollIndicator={false}>
@@ -238,6 +253,30 @@ export function CustomizeScreen({ game, ui, short }: { game: Game; ui: UiState; 
       <Columns left={left} right={right} ui={scale} ratio={0.82} />
     </ScreenFrame>
   );
+}
+
+/**
+ * The 3D preview, loaded only when 3D works on this phone (the same crash guard as the court),
+ * so a phone without WebGPU keeps the 2D preview instead of failing.
+ */
+function Stage3D(props: React.ComponentProps<typeof AvatarStage3DType>) {
+  const [C, setC] = useState<typeof AvatarStage3DType | null | false>(null);
+  useEffect(() => {
+    let alive = true;
+    is3DOff().then(off => {
+      if (!alive) return;
+      if (off) { setC(false); return; }
+      try {
+        const mod = require('./AvatarStage3D');
+        setC(() => mod.AvatarStage3D); // a component is a function: wrap it so React stores it
+      } catch (e) {
+        console.warn('3D preview failed to load, using the 2D preview:', e);
+        setC(false);
+      }
+    });
+    return () => { alive = false; };
+  }, []);
+  return C ? <C {...props} /> : <View style={{ width: props.width, height: props.height }}>{props.fallback}</View>;
 }
 
 function Stat({ label, value, z, color }: { label: string; value: number; z: (n: number) => number; color: string }) {
